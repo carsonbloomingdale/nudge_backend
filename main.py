@@ -10,7 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 origins = [
-    "http://localhost:3000",
+    "http://192.168.1.181:3000",
+    "http://nudgeweb.app/",
+    "https://nudgeweb.app/"
 ]
 
 app.add_middleware(
