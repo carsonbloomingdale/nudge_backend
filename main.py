@@ -9,11 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-origins = [
-    "http://192.168.1.181:3000",
-    "http://nudgeweb.app/",
-    "https://nudgeweb.app/"
-]
+origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
