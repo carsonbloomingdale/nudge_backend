@@ -1,7 +1,8 @@
 from typing import List, Annotated, Any, Optional
+
 from sqlalchemy.orm import Session
 from fastapi import FastAPI, HTTPException, Depends, Request
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from uuid import UUID, uuid4
 from database import SessionLocal, engine
 import models
@@ -9,22 +10,33 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
 import os
+import sys
 import random
 import time
 from collections import defaultdict, deque
 from threading import Lock
 from urllib import error, request
 
+
+def _parse_cors_origins() -> List[str]:
+    """Comma-separated URLs, or * for all. Example: http://localhost:3000,https://app.example.com"""
+    raw = (os.getenv("CORS_ORIGINS") or "*").strip()
+    if not raw or raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app = FastAPI()
 
-origins = ["*"]
+_cors_origins = _parse_cors_origins()
+_allow_credentials = False if _cors_origins == ["*"] else True
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials = True,
-    allow_methods=['*'],
-    allow_headers=['*']
+    allow_origins=_cors_origins,
+    allow_credentials=_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class PersonalityTrait(BaseModel):
@@ -56,6 +68,20 @@ class PersonModel(PersonBase):
     user_id: UUID
     
     model_config = ConfigDict(from_attributes=True)
+
+
+class CreateUserRequest(BaseModel):
+    """Body for POST /users/ — register by username only."""
+
+    username: str = Field(min_length=1, max_length=128)
+
+    @field_validator("username")
+    @classmethod
+    def username_not_blank(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("username cannot be blank")
+        return s
 
 
 class OpenAIRequestMeta(BaseModel):
@@ -254,10 +280,54 @@ async def _openai_chat_completion(system_prompt: str, user_prompt: str) -> tuple
                 content = "".join(str(chunk.get("text", "")) for chunk in content if isinstance(chunk, dict))
             return _extract_json_object(str(content)), attempt
         except error.HTTPError as exc:
+            err_text = ""
+            try:
+                err_text = exc.read().decode("utf-8", errors="replace")[:4000]
+            except Exception:
+                pass
+            openai_msg: Optional[str] = None
+            openai_type: Optional[str] = None
+            try:
+                ej = json.loads(err_text)
+                e = ej.get("error")
+                if isinstance(e, dict):
+                    openai_msg = e.get("message")
+                    openai_type = e.get("type") or e.get("code")
+            except json.JSONDecodeError:
+                pass
+
+            # Rate / quota limits — retry with backoff, then surface 429 to the client
+            if exc.code == 429:
+                last_error = exc
+                if attempt < OPENAI_RETRIES:
+                    retry_after: Optional[float] = None
+                    if exc.headers:
+                        try:
+                            retry_after = float(exc.headers.get("Retry-After", ""))
+                        except (TypeError, ValueError):
+                            retry_after = None
+                    base = (2**attempt) * 1.0 + random.uniform(0, 0.5)
+                    wait = min(retry_after if retry_after is not None else base, 45.0)
+                    await asyncio.sleep(wait)
+                    continue
+                if openai_type == "insufficient_quota" or (
+                    openai_msg and "quota" in openai_msg.lower()
+                ):
+                    detail = (
+                        "OpenAI quota exceeded (billing). Add credits or check your plan at "
+                        "https://platform.openai.com/account/billing"
+                    )
+                else:
+                    detail = openai_msg or (
+                        "OpenAI rate limit — wait a minute and try again, or reduce request frequency."
+                    )
+                raise HTTPException(status_code=429, detail=detail)
+
             if 500 <= exc.code < 600:
                 last_error = exc
             else:
-                raise HTTPException(status_code=502, detail=f"OpenAI request failed with status {exc.code}.")
+                detail = openai_msg or f"OpenAI request failed with status {exc.code}."
+                raise HTTPException(status_code=502, detail=detail)
         except (error.URLError, TimeoutError, json.JSONDecodeError, KeyError) as exc:
             last_error = exc
 
@@ -314,12 +384,17 @@ async def create_task(task: TaskBase, db: db_dependency):
 
 
 @app.post("/users/", response_model=PersonModel)
-async def create_person(person: PersonBase, db: db_dependency):
-    db_transaction = models.Person(**person.dict())
-    db.add(db_transaction)
+async def create_user(body: CreateUserRequest, db: db_dependency):
+    username = body.username
+    existing = db.query(models.Person).filter(models.Person.user_name == username).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    # email unused by current clients; column exists on model — store empty string
+    person = models.Person(user_name=username, email="")
+    db.add(person)
     db.commit()
-    db.refresh(db_transaction)
-    return db_transaction
+    db.refresh(person)
+    return person
 
 @app.get("/users", response_model=List[PersonModel])
 async def read_users(db: db_dependency, skip: int = 0, limit: int = 100):
@@ -334,13 +409,25 @@ async def read_tasks(db: db_dependency, skip: int = 0, limit: int = 100):
 
 
 @app.get("/user_by_id/{user_id}", response_model=PersonModel)
-async def user_by_id(user_id,db: db_dependency):
-    user = db.query(models.Person).filter(models.Person.user_id == UUID(user_id)).first()
+async def user_by_id(user_id: str, db: db_dependency):
+    try:
+        uid = UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid user id format") from exc
+    user = db.query(models.Person).filter(models.Person.user_id == uid).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
     return user
 
+
 @app.get("/user_by_username/{username}", response_model=PersonModel)
-async def user_by_user_name(username,db: db_dependency):
-    user = db.query(models.Person).filter(models.Person.user_name == username).first()
+async def user_by_user_name(username: str, db: db_dependency):
+    key = username.strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Username required")
+    user = db.query(models.Person).filter(models.Person.user_name == key).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
     return user
 
 
@@ -364,3 +451,19 @@ async def create_suggestion(body: SuggestionRequest, request: Request):
     raw_payload, retries_used = await _openai_chat_completion(system_prompt, user_prompt)
     normalized = _normalize_suggestion(raw_payload)
     return SuggestionResponse(suggestion=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
+
+
+if __name__ == "__main__":
+    try:
+        import uvicorn
+    except ModuleNotFoundError:
+        print(
+            "Missing dependency: uvicorn. Activate your project venv and run:\n"
+            "  pip install -r requirements.txt\n"
+            "Or run: ./scripts/dev.sh",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
