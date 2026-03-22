@@ -46,6 +46,10 @@ def register_user(client):
         r = client.post("/auth/register", json=body)
         assert r.status_code == 200, r.text
         data = r.json()
+        # Register sets JWT cookies; get_access_token_from_request reads cookie before
+        # Authorization. Clear cookies so tests that pass Bearer use that token, not
+        # the last user who registered on this client.
+        client.cookies.clear()
         return data["access_token"], username, email
 
     return _register
