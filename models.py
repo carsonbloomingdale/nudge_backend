@@ -1,5 +1,5 @@
 from database import Base
-from sqlalchemy import Column, String, Integer,ForeignKey
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, mapped_column
 import uuid
@@ -34,6 +34,12 @@ class Person(Base):
     user_id= mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email=Column(String)
     password_hash = Column(String, nullable=True)
+    first_name = Column(String(128), nullable=True)
+    last_name = Column(String(128), nullable=True)
+    phone_e164 = Column(String(20), nullable=True)
+    timezone = Column(String(64), nullable=True)
+    sms_opt_in = Column(Boolean, nullable=False, default=False)
+    phone_verified_at = Column(DateTime(timezone=True), nullable=True)
     person_tasks = relationship(
         "Task",
         primaryjoin="and_(Task.user_id==Person.user_id)",
