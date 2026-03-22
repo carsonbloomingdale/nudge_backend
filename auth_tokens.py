@@ -141,6 +141,29 @@ def get_access_token_from_request(request: Request) -> Optional[str]:
     return None
 
 
+def auth_request_debug_context(request: Request) -> dict[str, Any]:
+    """
+    Non-sensitive fields for diagnosing missing/invalid JWTs.
+    Never includes cookie values or bearer tokens.
+    """
+    auth = request.headers.get("authorization")
+    if not auth:
+        auth_scheme = "absent"
+    elif auth.lower().startswith("bearer "):
+        rest = auth[7:].strip()
+        auth_scheme = "bearer" if rest else "bearer_empty"
+    else:
+        auth_scheme = "non_bearer"
+
+    return {
+        "cookie_header_present": bool(request.headers.get("cookie")),
+        "access_cookie_present": COOKIE_ACCESS_NAME in request.cookies,
+        "authorization_scheme": auth_scheme,
+        "origin": request.headers.get("origin"),
+        "user_agent": (request.headers.get("user-agent") or "")[:160],
+    }
+
+
 def attach_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
     common = {
         "httponly": True,
