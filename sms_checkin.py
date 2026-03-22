@@ -328,9 +328,17 @@ async def _extract_tasks_from_reply(sms_text: str, day_of_week: str) -> list[dic
 
 
 def _persist_tasks(db: Session, user_id: Any, task_dicts: list[dict[str, str]]) -> None:
-    for data in task_dicts:
-        row = models.Task(user_id=user_id, **data)
-        db.add(row)
+    if not task_dicts:
+        return
+    from journal_service import insert_journal_with_tasks
+
+    insert_journal_with_tasks(
+        db,
+        user_id=user_id,
+        task_field_dicts=task_dicts,
+        source="sms",
+        note=None,
+    )
 
 
 def start_sms_scheduler() -> None:

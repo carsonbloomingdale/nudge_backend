@@ -30,6 +30,8 @@ def _path_requires_task_auth(path: str) -> bool:
         return True
     if p == "/api/suggestions":
         return True
+    if p.startswith("/api/journals"):
+        return True
     return False
 
 

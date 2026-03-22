@@ -22,5 +22,6 @@ python-jose[cryptography]==3.3.0
 bcrypt==4.2.1
 httpx==0.28.1
 pytest==8.4.2
+boto3>=1.35,<2
 twilio>=9.0,<10
 APScheduler>=3.10,<4.0
