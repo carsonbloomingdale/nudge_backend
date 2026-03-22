@@ -12,6 +12,10 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["JWT_SECRET_KEY"] = "unit-test-jwt-secret-key-32chars!!"
 os.environ["AUTH_RETURN_TOKENS_IN_BODY"] = "true"
 os.environ.setdefault("OPENAI_API_KEY", "")
+os.environ.setdefault("TWILIO_ACCOUNT_SID", "ACtest")
+os.environ.setdefault("TWILIO_AUTH_TOKEN", "test_twilio_auth_token")
+os.environ.setdefault("TWILIO_PHONE_NUMBER", "+15550000001")
+os.environ.setdefault("SMS_DRY_RUN", "true")
 
 import pytest
 

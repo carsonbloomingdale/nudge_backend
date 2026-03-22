@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 import main
 import models
+from database import SessionLocal
 from main import RegisterRequest
 
 
@@ -27,6 +28,67 @@ def test_register_minimal_me_has_default_profile_fields(client, register_user):
     assert data["timezone"] is None
     assert data["sms_opt_in"] is False
     assert data["phone_verified_at"] is None
+
+
+def test_auth_me_sms_test_sends_message(client, monkeypatch):
+    import sms_checkin
+
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(to: str, body: str) -> str:
+        sent.append((to, body))
+        return "SMtestfake"
+
+    monkeypatch.setattr(sms_checkin, "send_twilio_sms", fake_send)
+    r = client.post(
+        "/auth/register",
+        json={
+            "username": "sms_test_btn_user",
+            "email": "sms_test_btn@example.test",
+            "password": "password123",
+            "phone_e164": "+15555550888",
+            "timezone": "America/Chicago",
+            "sms_opt_in": True,
+        },
+    )
+    assert r.status_code == 200
+    token = r.json()["access_token"]
+    client.cookies.clear()
+    sent.clear()
+
+    r2 = client.post("/auth/me/sms/test", headers=_bearer_headers(token))
+    assert r2.status_code == 200
+    assert r2.json() == {"ok": True}
+    assert len(sent) == 1
+    assert sent[0][0] == "+15555550888"
+    assert "Nudge test message" in sent[0][1]
+
+
+def test_register_sms_opt_in_sends_welcome_sms(client, monkeypatch):
+    import sms_checkin
+
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(to: str, body: str) -> str:
+        sent.append((to, body))
+        return "SMwelcomefake"
+
+    monkeypatch.setattr(sms_checkin, "send_twilio_sms", fake_send)
+    r = client.post(
+        "/auth/register",
+        json={
+            "username": "welcome_sms_user",
+            "email": "welcome_sms@example.test",
+            "password": "password123",
+            "phone_e164": "+15555550999",
+            "timezone": "America/Chicago",
+            "sms_opt_in": True,
+        },
+    )
+    assert r.status_code == 200
+    assert len(sent) == 1
+    assert sent[0][0] == "+15555550999"
+    assert "Welcome to Nudge" in sent[0][1]
 
 
 def test_register_with_optional_profile_persisted(client, register_user):
@@ -120,7 +182,7 @@ def test_patch_phone_change_clears_phone_verified_at(client, register_user):
         suffix="verify",
         extra={"phone_e164": "+15555550100"},
     )
-    db = main.SessionLocal()
+    db = SessionLocal()
     try:
         user = db.query(models.Person).filter(models.Person.user_name == "user_verify").one()
         user.phone_verified_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
