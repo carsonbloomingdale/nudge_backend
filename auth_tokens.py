@@ -53,15 +53,6 @@ def auth_configured() -> bool:
     return bool(s and len(s) >= 32)
 
 
-def auth_return_tokens_in_body() -> bool:
-    """
-    When true, login/register/refresh responses also include access_token + refresh_token in JSON.
-    Use when mobile Safari / ITP blocks cross-site httpOnly cookies; the SPA should then send
-    Authorization: Bearer <access_token> (and keep refresh in memory/sessionStorage — XSS risk).
-    """
-    return os.getenv("AUTH_RETURN_TOKENS_IN_BODY", "").lower() in ("1", "true", "yes")
-
-
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(_password_bytes(plain), bcrypt.gensalt(rounds=12)).decode("ascii")
 
