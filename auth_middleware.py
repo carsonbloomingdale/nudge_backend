@@ -5,12 +5,21 @@ Complements Depends(get_current_user), which loads the Person row and enforces o
 
 from __future__ import annotations
 
+import logging
+
 from jose import JWTError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from auth_tokens import auth_configured, decode_token, get_access_token_from_request
+from auth_tokens import (
+    auth_configured,
+    auth_request_debug_context,
+    decode_token,
+    get_access_token_from_request,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _path_requires_task_auth(path: str) -> bool:
@@ -42,7 +51,16 @@ class TaskAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = get_access_token_from_request(request)
+        client_host = request.client.host if request.client else None
+        debug_ctx = auth_request_debug_context(request)
         if not token:
+            logger.info(
+                "Task auth 401 not_authenticated method=%s path=%s client=%s detail=%s",
+                request.method,
+                path,
+                client_host,
+                debug_ctx,
+            )
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Not authenticated"},
@@ -50,7 +68,15 @@ class TaskAuthMiddleware(BaseHTTPMiddleware):
             )
         try:
             decode_token(token, expected_type="access")
-        except JWTError:
+        except JWTError as exc:
+            logger.info(
+                "Task auth 401 invalid_token method=%s path=%s client=%s jwt_error=%s detail=%s",
+                request.method,
+                path,
+                client_host,
+                str(exc),
+                debug_ctx,
+            )
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or expired token"},
