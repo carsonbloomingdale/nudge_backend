@@ -2,10 +2,13 @@ import os
 import re
 from pathlib import Path
 
+from typing import Annotated, Generator
+
 from dotenv import load_dotenv
+from fastapi import Depends
 from sqlalchemy import create_engine
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 # Load from repo root (not cwd — fixes uvicorn/Cursor when cwd ≠ project dir)
 _ROOT = Path(__file__).resolve().parent
@@ -61,8 +64,8 @@ if is_sqlite and ":memory:" in DATABASE_URL:
     )
 else:
     connect_args = {"check_same_thread": False} if is_sqlite else {}
-    # Heroku Postgres (and similar) may close idle connections or cycle during maintenance.
-    # Without pre-ping, a dead connection can be reused from the pool and raise AdminShutdown.
+    # Managed Postgres (Heroku and similar) may close idle connections or cycle during maintenance.
+    # pool_pre_ping avoids reusing dead connections from the pool (e.g. AdminShutdown).
     if is_sqlite:
         engine = create_engine(DATABASE_URL, connect_args=connect_args)
     else:
@@ -75,6 +78,17 @@ else:
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+DbSession = Annotated[Session, Depends(get_db)]
 
 
 def ensure_auth_columns(engine) -> None:

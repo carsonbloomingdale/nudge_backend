@@ -1,25 +1,26 @@
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Annotated, Any, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, Field, ConfigDict, computed_field, field_validator, model_validator
 from uuid import UUID
-from database import SessionLocal, engine, ensure_auth_columns, ensure_person_profile_columns
+from database import DbSession, engine, ensure_auth_columns, ensure_person_profile_columns
+from openai_client import OPENAI_MODEL, OPENAI_SUGGESTION_TEMPERATURE, openai_chat_completion
 import models
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError
 import asyncio
 import json
+import logging
 import os
 import sys
-import random
 import time
 from collections import defaultdict, deque
 from threading import Lock
-from urllib import error, request
 
 from auth_middleware import TaskAuthMiddleware
 from auth_tokens import (
@@ -35,6 +36,8 @@ from auth_tokens import (
     hash_password,
     verify_password,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_cors_config() -> tuple[list[str], Optional[str], bool]:
@@ -61,7 +64,16 @@ def _parse_cors_config() -> tuple[list[str], Optional[str], bool]:
     return origins, regex, allow_credentials
 
 
-app = FastAPI(title="Nudge API")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    from sms_checkin import start_sms_scheduler, stop_sms_scheduler
+
+    start_sms_scheduler()
+    yield
+    stop_sms_scheduler()
+
+
+app = FastAPI(title="Nudge API", lifespan=_lifespan)
 
 _cors_origins, _cors_origin_regex, _allow_credentials = _parse_cors_config()
 
@@ -139,39 +151,12 @@ class CreateUserRequest(BaseModel):
         return s
 
 
-class UserPublic(BaseModel):
-    user_id: UUID
-    user_name: str
-    email: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class AuthSessionResponse(UserPublic):
-    """Same as UserPublic; optional token fields when AUTH_RETURN_TOKENS_IN_BODY is enabled."""
-
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    token_type: Optional[Literal["bearer"]] = None
-
-
-class RefreshOkResponse(BaseModel):
+class SmsTestResponse(BaseModel):
     ok: bool = True
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    token_type: Optional[Literal["bearer"]] = None
 
 
-def _auth_session_response(person: models.Person, access: str, refresh: str) -> AuthSessionResponse:
-    base = UserPublic.model_validate(person).model_dump()
-    if auth_return_tokens_in_body():
-        return AuthSessionResponse(
-            **base,
-            access_token=access,
-            refresh_token=refresh,
-            token_type="bearer",
-        )
-    return AuthSessionResponse(**base)
+class PhoneOtpVerifyBody(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
 class AuthMeResponse(BaseModel):
@@ -189,6 +174,29 @@ class AuthMeResponse(BaseModel):
     timezone: Optional[str] = None
     sms_opt_in: bool = False
     phone_verified_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @computed_field
+    @property
+    def phone_verified(self) -> bool:
+        return self.phone_verified_at is not None
+
+
+class AuthSessionResponse(AuthMeResponse):
+    """Same fields as GET /auth/me plus optional tokens when AUTH_RETURN_TOKENS_IN_BODY is enabled."""
+
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[Literal["bearer"]] = None
+
+
+class RefreshOkResponse(BaseModel):
+    ok: bool = True
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[Literal["bearer"]] = None
+    profile: Optional[AuthMeResponse] = None
 
 
 _PHONE_E164_RE = re.compile(r"^\+[1-9]\d{1,14}$")
@@ -381,15 +389,7 @@ class SuggestionResponse(BaseModel):
     meta: OpenAIRequestMeta
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-db_dependency = Annotated[Session, Depends(get_db)]
+db_dependency = DbSession
 
 models.Base.metadata.create_all(bind=engine)
 ensure_auth_columns(engine)
@@ -445,12 +445,19 @@ def _auth_me_response(user: models.Person) -> AuthMeResponse:
         phone_verified_at=user.phone_verified_at,
     )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_SUGGESTION_TEMPERATURE = float(os.getenv("OPENAI_SUGGESTION_TEMPERATURE", "0.85"))
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "15"))
-OPENAI_RETRIES = int(os.getenv("OPENAI_RETRIES", "2"))
+
+def _auth_session_response(person: models.Person, access: str, refresh: str) -> AuthSessionResponse:
+    me = _auth_me_response(person)
+    data = me.model_dump()
+    if auth_return_tokens_in_body():
+        return AuthSessionResponse(
+            **data,
+            access_token=access,
+            refresh_token=refresh,
+            token_type="bearer",
+        )
+    return AuthSessionResponse(**data)
+
 
 RATE_LIMIT_REQUESTS = int(os.getenv("API_RATE_LIMIT_REQUESTS", "20"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -483,28 +490,6 @@ def _enforce_rate_limit(client_key: str) -> None:
         if len(bucket) >= RATE_LIMIT_REQUESTS:
             raise HTTPException(status_code=429, detail="Rate limit exceeded, try again soon.")
         bucket.append(now)
-
-
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    stripped = (raw_text or "").strip()
-    if not stripped:
-        return {}
-    try:
-        parsed = json.loads(stripped)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return {}
-    try:
-        parsed = json.loads(stripped[start : end + 1])
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        return {}
 
 
 def _normalize_enriched_task(raw_payload: dict[str, Any], original_task: str) -> EnrichedTask:
@@ -559,98 +544,6 @@ def _normalize_suggestion(raw_payload: dict[str, Any]) -> SuggestionPayload:
         reccomendedTask=str(recommendation).strip()[:220],
         context=str(context).strip()[:350],
     )
-
-
-async def _openai_chat_completion(
-    system_prompt: str, user_prompt: str, *, temperature: float = 0.2
-) -> tuple[dict[str, Any], int]:
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OpenAI service is not configured.")
-
-    body = {
-        "model": OPENAI_MODEL,
-        "temperature": temperature,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-    payload = json.dumps(body).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    last_error: Optional[Exception] = None
-    for attempt in range(OPENAI_RETRIES + 1):
-        req = request.Request(OPENAI_URL, data=payload, headers=headers, method="POST")
-        try:
-            response_bytes = await asyncio.to_thread(
-                request.urlopen,
-                req,
-                timeout=OPENAI_TIMEOUT_SECONDS,
-            )
-            raw = response_bytes.read().decode("utf-8")
-            parsed = json.loads(raw)
-            content = parsed["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(str(chunk.get("text", "")) for chunk in content if isinstance(chunk, dict))
-            return _extract_json_object(str(content)), attempt
-        except error.HTTPError as exc:
-            err_text = ""
-            try:
-                err_text = exc.read().decode("utf-8", errors="replace")[:4000]
-            except Exception:
-                pass
-            openai_msg: Optional[str] = None
-            openai_type: Optional[str] = None
-            try:
-                ej = json.loads(err_text)
-                e = ej.get("error")
-                if isinstance(e, dict):
-                    openai_msg = e.get("message")
-                    openai_type = e.get("type") or e.get("code")
-            except json.JSONDecodeError:
-                pass
-
-            if exc.code == 429:
-                last_error = exc
-                if attempt < OPENAI_RETRIES:
-                    retry_after: Optional[float] = None
-                    if exc.headers:
-                        try:
-                            retry_after = float(exc.headers.get("Retry-After", ""))
-                        except (TypeError, ValueError):
-                            retry_after = None
-                    base = (2**attempt) * 1.0 + random.uniform(0, 0.5)
-                    wait = min(retry_after if retry_after is not None else base, 45.0)
-                    await asyncio.sleep(wait)
-                    continue
-                if openai_type == "insufficient_quota" or (
-                    openai_msg and "quota" in openai_msg.lower()
-                ):
-                    detail = (
-                        "OpenAI quota exceeded (billing). Add credits or check your plan at "
-                        "https://platform.openai.com/account/billing"
-                    )
-                else:
-                    detail = openai_msg or (
-                        "OpenAI rate limit — wait a minute and try again, or reduce request frequency."
-                    )
-                raise HTTPException(status_code=429, detail=detail)
-
-            if 500 <= exc.code < 600:
-                last_error = exc
-            else:
-                detail = openai_msg or f"OpenAI request failed with status {exc.code}."
-                raise HTTPException(status_code=502, detail=detail)
-        except (error.URLError, TimeoutError, json.JSONDecodeError, KeyError) as exc:
-            last_error = exc
-
-        if attempt < OPENAI_RETRIES:
-            await asyncio.sleep((2**attempt) * 0.5 + random.uniform(0, 0.2))
-
-    raise HTTPException(status_code=502, detail=f"OpenAI request failed after retries: {last_error}")
 
 
 def _build_enrich_prompts(task: str, task_history: List[dict[str, Any]]) -> tuple[str, str]:
@@ -774,6 +667,99 @@ async def auth_me(user: CurrentUser):
     return _auth_me_response(user)
 
 
+@app.post("/auth/me/phone/send-verification-code", response_model=AuthMeResponse)
+async def auth_me_phone_send_verification_code(user: CurrentUser, db: db_dependency):
+    """Send or start SMS verification for profile phone_e164.
+
+    With `TWILIO_VERIFY_SERVICE_SID`, uses Twilio Verify (recommended). Otherwise sends a custom
+    Programmable SMS body (may require toll-free verification for that sender).
+    """
+    from phone_sms_verify import send_phone_verification
+    from sms_checkin import SmsUpstreamError
+
+    try:
+        send_phone_verification(db, user)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError:
+        raise HTTPException(
+            status_code=503,
+            detail="SMS is not configured on this server.",
+        )
+    except SmsUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Phone OTP send failed user_id=%s", user.user_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not send verification text. Try again later.",
+        )
+    db.refresh(user)
+    return _auth_me_response(user)
+
+
+@app.post("/auth/me/phone/verify", response_model=AuthMeResponse)
+async def auth_me_phone_verify(user: CurrentUser, db: db_dependency, body: PhoneOtpVerifyBody):
+    """Submit the 6-digit code from SMS; sets phone_verified_at and may send welcome SMS if sms_opt_in."""
+    if user.phone_verified_at is not None:
+        raise HTTPException(status_code=400, detail="Phone number is already verified")
+    from phone_sms_verify import verify_phone_code
+    from sms_checkin import send_welcome_sms_if_opted_in
+
+    ok = verify_phone_code(db, user, body.code)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+    db.refresh(user)
+    await asyncio.to_thread(
+        send_welcome_sms_if_opted_in,
+        user.phone_e164,
+        bool(user.sms_opt_in),
+        user.phone_verified_at,
+    )
+    return _auth_me_response(user)
+
+
+@app.post("/auth/me/sms/test", response_model=SmsTestResponse)
+async def auth_me_sms_test(user: CurrentUser):
+    """Send a test SMS to the signed-in user's phone (profile must have SMS enabled + E.164 phone)."""
+    if not bool(user.sms_opt_in):
+        raise HTTPException(
+            status_code=400,
+            detail="Turn on SMS notifications in your profile to send a test message.",
+        )
+    if user.phone_verified_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Verify your phone number first (POST /auth/me/phone/send-verification-code, then /verify).",
+        )
+    phone = (user.phone_e164 or "").strip()
+    if not phone:
+        raise HTTPException(
+            status_code=400,
+            detail="Add a phone number (E.164) to your profile first.",
+        )
+    from sms_checkin import SmsUpstreamError, send_account_test_sms
+
+    try:
+        await asyncio.to_thread(send_account_test_sms, phone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError:
+        raise HTTPException(
+            status_code=503,
+            detail="SMS is not configured on this server.",
+        )
+    except SmsUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Test SMS failed user_id=%s", user.user_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not send test SMS. Try again later.",
+        )
+    return SmsTestResponse()
+
+
 @app.patch("/auth/me", response_model=AuthMeResponse)
 async def auth_patch_me(user: CurrentUser, body: PatchMeRequest, db: db_dependency):
     """Partial profile update (allowlisted fields only)."""
@@ -845,6 +831,7 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
             access_token=new_access,
             refresh_token=new_refresh,
             token_type="bearer",
+            profile=_auth_me_response(user),
         )
     return RefreshOkResponse(ok=True)
 
@@ -883,7 +870,7 @@ async def enrich_task(body: EnrichTaskRequest, request: Request, user: CurrentUs
     _enforce_rate_limit(client_key)
 
     system_prompt, user_prompt = _build_enrich_prompts(body.task, body.taskHistory)
-    raw_payload, retries_used = await _openai_chat_completion(system_prompt, user_prompt)
+    raw_payload, retries_used = await openai_chat_completion(system_prompt, user_prompt)
     normalized = _normalize_enriched_task(raw_payload, body.task)
     return EnrichTaskResponse(task=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
 
@@ -895,7 +882,7 @@ async def create_suggestion(body: SuggestionRequest, request: Request, user: Cur
     _enforce_rate_limit(client_key)
 
     system_prompt, user_prompt = _build_suggestion_prompts(body.taskHistory)
-    raw_payload, retries_used = await _openai_chat_completion(
+    raw_payload, retries_used = await openai_chat_completion(
         system_prompt, user_prompt, temperature=OPENAI_SUGGESTION_TEMPERATURE
     )
     normalized = _normalize_suggestion(raw_payload)
@@ -945,6 +932,11 @@ async def user_by_user_name(username: str, db: db_dependency):
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
+
+from sms_checkin import sms_router
+
+app.include_router(sms_router)
 
 
 if __name__ == "__main__":

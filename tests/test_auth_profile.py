@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
 
 import main
 import models
+from database import SessionLocal
 from main import RegisterRequest
 
 
@@ -27,6 +28,148 @@ def test_register_minimal_me_has_default_profile_fields(client, register_user):
     assert data["timezone"] is None
     assert data["sms_opt_in"] is False
     assert data["phone_verified_at"] is None
+    assert data["phone_verified"] is False
+
+
+def test_auth_me_sms_test_sends_message(client, monkeypatch):
+    import phone_sms_verify
+    import sms_checkin
+
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(to: str, body: str) -> str:
+        sent.append((to, body))
+        return "SMtestfake"
+
+    monkeypatch.setattr(sms_checkin, "send_twilio_sms", fake_send)
+    monkeypatch.setattr(phone_sms_verify, "generate_otp_code", lambda: "222222")
+
+    r = client.post(
+        "/auth/register",
+        json={
+            "username": "sms_test_btn_user",
+            "email": "sms_test_btn@example.test",
+            "password": "password123",
+            "phone_e164": "+15555550888",
+            "timezone": "America/Chicago",
+            "sms_opt_in": True,
+        },
+    )
+    assert r.status_code == 200
+    token = r.json()["access_token"]
+    client.cookies.clear()
+
+    assert client.post("/auth/me/phone/send-verification-code", headers=_bearer_headers(token)).status_code == 200
+    assert client.post(
+        "/auth/me/phone/verify",
+        headers=_bearer_headers(token),
+        json={"code": "222222"},
+    ).status_code == 200
+    sent.clear()
+
+    r2 = client.post("/auth/me/sms/test", headers=_bearer_headers(token))
+    assert r2.status_code == 200
+    assert r2.json() == {"ok": True}
+    assert len(sent) == 1
+    assert sent[0][0] == "+15555550888"
+    assert "Nudge test message" in sent[0][1]
+
+
+def test_register_sms_opt_in_welcome_after_phone_verify(client, monkeypatch):
+    import phone_sms_verify
+    import sms_checkin
+
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(to: str, body: str) -> str:
+        sent.append((to, body))
+        return "SMwelcomefake"
+
+    monkeypatch.setattr(sms_checkin, "send_twilio_sms", fake_send)
+    monkeypatch.setattr(phone_sms_verify, "generate_otp_code", lambda: "654321")
+
+    r = client.post(
+        "/auth/register",
+        json={
+            "username": "welcome_sms_user",
+            "email": "welcome_sms@example.test",
+            "password": "password123",
+            "phone_e164": "+15555550999",
+            "timezone": "America/Chicago",
+            "sms_opt_in": True,
+        },
+    )
+    assert r.status_code == 200
+    assert len(sent) == 0
+
+    token = r.json()["access_token"]
+    client.cookies.clear()
+    r2 = client.post(
+        "/auth/me/phone/send-verification-code",
+        headers=_bearer_headers(token),
+    )
+    assert r2.status_code == 200
+    assert len(sent) == 1
+    assert sent[0][0] == "+15555550999"
+    assert "654321" in sent[0][1]
+
+    r3 = client.post(
+        "/auth/me/phone/verify",
+        headers=_bearer_headers(token),
+        json={"code": "654321"},
+    )
+    assert r3.status_code == 200
+    assert r3.json()["phone_verified"] is True
+    assert r3.json()["phone_verified_at"] is not None
+    assert len(sent) == 2
+    assert "Welcome to Nudge" in sent[1][1]
+
+
+def test_send_verification_allowed_after_expired_otp_cleared(client, monkeypatch):
+    """Expired challenges must not count toward hourly cap or block resend."""
+    import phone_sms_verify
+    import sms_checkin
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(sms_checkin, "send_twilio_sms", lambda to, body: sent.append((to, body)) or "SMx")
+    monkeypatch.setattr(phone_sms_verify, "generate_otp_code", lambda: "444444")
+
+    r = client.post(
+        "/auth/register",
+        json={
+            "username": "user_expire_otp",
+            "email": "expire_otp@example.test",
+            "password": "password123",
+            "phone_e164": "+15555550777",
+            "timezone": "UTC",
+            "sms_opt_in": True,
+        },
+    )
+    assert r.status_code == 200
+    token = r.json()["access_token"]
+    client.cookies.clear()
+
+    db = SessionLocal()
+    try:
+        u = db.query(models.Person).filter(models.Person.user_name == "user_expire_otp").one()
+        db.add(
+            models.PhoneOtpChallenge(
+                user_id=u.user_id,
+                code_hash="deadbeef",
+                expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    r2 = client.post(
+        "/auth/me/phone/send-verification-code",
+        headers=_bearer_headers(token),
+    )
+    assert r2.status_code == 200
+    assert len(sent) == 1
+    assert "444444" in sent[0][1]
 
 
 def test_register_with_optional_profile_persisted(client, register_user):
@@ -48,6 +191,8 @@ def test_register_with_optional_profile_persisted(client, register_user):
     assert data["phone_e164"] == "+15555550123"
     assert data["timezone"] == "America/New_York"
     assert data["sms_opt_in"] is True
+    assert data["phone_verified_at"] is None
+    assert data["phone_verified"] is False
 
 
 def test_patch_partial_updates_only_sent_fields(client, register_user):
@@ -120,7 +265,7 @@ def test_patch_phone_change_clears_phone_verified_at(client, register_user):
         suffix="verify",
         extra={"phone_e164": "+15555550100"},
     )
-    db = main.SessionLocal()
+    db = SessionLocal()
     try:
         user = db.query(models.Person).filter(models.Person.user_name == "user_verify").one()
         user.phone_verified_at = datetime(2020, 1, 1, tzinfo=timezone.utc)

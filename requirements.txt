@@ -2,6 +2,7 @@ annotated-types==0.7.0
 anyio==4.11.0
 click>=8.1.7,<9
 fastapi==0.118.0
+python-multipart>=0.0.9,<1
 h11==0.16.0
 httptools==0.7.1
 idna==3.11
@@ -21,3 +22,5 @@ python-jose[cryptography]==3.3.0
 bcrypt==4.2.1
 httpx==0.28.1
 pytest==8.4.2
+twilio>=9.0,<10
+APScheduler>=3.10,<4.0
