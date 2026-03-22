@@ -447,6 +447,7 @@ def _auth_me_response(user: models.Person) -> AuthMeResponse:
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_SUGGESTION_TEMPERATURE = float(os.getenv("OPENAI_SUGGESTION_TEMPERATURE", "0.85"))
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "15"))
 OPENAI_RETRIES = int(os.getenv("OPENAI_RETRIES", "2"))
@@ -560,13 +561,15 @@ def _normalize_suggestion(raw_payload: dict[str, Any]) -> SuggestionPayload:
     )
 
 
-async def _openai_chat_completion(system_prompt: str, user_prompt: str) -> tuple[dict[str, Any], int]:
+async def _openai_chat_completion(
+    system_prompt: str, user_prompt: str, *, temperature: float = 0.2
+) -> tuple[dict[str, Any], int]:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OpenAI service is not configured.")
 
     body = {
         "model": OPENAI_MODEL,
-        "temperature": 0.2,
+        "temperature": temperature,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -671,16 +674,29 @@ def _build_enrich_prompts(task: str, task_history: List[dict[str, Any]]) -> tupl
 
 
 def _build_suggestion_prompts(task_history: List[dict[str, Any]]) -> tuple[str, str]:
+    trimmed = _trim_task_history(task_history)
+    has_signal = any(
+        (row.get("label") or "").strip() or (row.get("context") or "").strip() for row in trimmed
+    )
     system_prompt = (
-        "You recommend one practical next task. Return strict JSON only with this exact shape: "
+        "You recommend one concrete next task for a productivity app. "
+        "Ground it in recent_task_history when possible. "
+        "Return strict JSON only with this exact shape: "
         '{"suggestion":{"reccomendedTask":"string","context":"string"}}.'
     )
     user_prompt = json.dumps(
         {
-            "recent_task_history": _trim_task_history(task_history),
+            "recent_task_history": trimmed,
+            "history_has_specific_tasks": has_signal,
             "rules": [
-                "Recommend one specific task.",
-                "Context should explain why this task is recommended.",
+                "reccomendedTask: one short imperative line (about 12 words or fewer).",
+                "context: one sentence that ties the suggestion to patterns in recent_task_history.",
+                "Prefer a logical follow-up, unblocker, or natural break given their categories and sentiments.",
+                "Do not assume facts not supported by recent_task_history (pets, children, commute, health) "
+                "unless labels or context clearly mention them.",
+                "Avoid clichéd generic wellness filler (e.g. walk your dog, drink more water) unless history relates.",
+                "Do not merely repeat the latest task label; choose a distinct next step unless repeating is clearly useful.",
+                "If history_has_specific_tasks is false, suggest a neutral productive micro-task that needs no private details.",
                 "Avoid unsafe or medical/financial advice.",
             ],
         }
@@ -765,26 +781,22 @@ async def auth_patch_me(user: CurrentUser, body: PatchMeRequest, db: db_dependen
     if "username" in updates:
         updates["user_name"] = updates.pop("username")
     if "user_name" in updates:
-        taken = (
+        # Load by value first, then compare ids in Python — SQLite + postgresql.UUID
+        # can mis-handle `column != uuid` in SQL while equality works.
+        other = (
             db.query(models.Person)
-            .filter(
-                models.Person.user_name == updates["user_name"],
-                models.Person.user_id != user.user_id,
-            )
+            .filter(models.Person.user_name == updates["user_name"])
             .first()
         )
-        if taken:
+        if other is not None and other.user_id != user.user_id:
             raise HTTPException(status_code=409, detail="Username already exists")
     if "email" in updates:
-        taken = (
+        other = (
             db.query(models.Person)
-            .filter(
-                models.Person.email == updates["email"],
-                models.Person.user_id != user.user_id,
-            )
+            .filter(models.Person.email == updates["email"])
             .first()
         )
-        if taken:
+        if other is not None and other.user_id != user.user_id:
             raise HTTPException(status_code=409, detail="Email already registered")
     if "phone_e164" in updates:
         new_phone = updates["phone_e164"]
@@ -883,7 +895,9 @@ async def create_suggestion(body: SuggestionRequest, request: Request, user: Cur
     _enforce_rate_limit(client_key)
 
     system_prompt, user_prompt = _build_suggestion_prompts(body.taskHistory)
-    raw_payload, retries_used = await _openai_chat_completion(system_prompt, user_prompt)
+    raw_payload, retries_used = await _openai_chat_completion(
+        system_prompt, user_prompt, temperature=OPENAI_SUGGESTION_TEMPERATURE
+    )
     normalized = _normalize_suggestion(raw_payload)
     return SuggestionResponse(suggestion=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
 
