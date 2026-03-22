@@ -26,7 +26,6 @@ from auth_middleware import TaskAuthMiddleware
 from auth_tokens import (
     attach_auth_cookies,
     auth_configured,
-    auth_return_tokens_in_body,
     clear_auth_cookies,
     create_access_token,
     create_refresh_token,
@@ -184,7 +183,7 @@ class AuthMeResponse(BaseModel):
 
 
 class AuthSessionResponse(AuthMeResponse):
-    """Same fields as GET /auth/me plus optional tokens when AUTH_RETURN_TOKENS_IN_BODY is enabled."""
+    """Same fields as GET /auth/me plus access_token and refresh_token for clients that use Authorization: Bearer (e.g. Safari / ITP where cookies are unreliable)."""
 
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
@@ -449,14 +448,12 @@ def _auth_me_response(user: models.Person) -> AuthMeResponse:
 def _auth_session_response(person: models.Person, access: str, refresh: str) -> AuthSessionResponse:
     me = _auth_me_response(person)
     data = me.model_dump()
-    if auth_return_tokens_in_body():
-        return AuthSessionResponse(
-            **data,
-            access_token=access,
-            refresh_token=refresh,
-            token_type="bearer",
-        )
-    return AuthSessionResponse(**data)
+    return AuthSessionResponse(
+        **data,
+        access_token=access,
+        refresh_token=refresh,
+        token_type="bearer",
+    )
 
 
 RATE_LIMIT_REQUESTS = int(os.getenv("API_RATE_LIMIT_REQUESTS", "20"))
@@ -825,15 +822,13 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
     new_access = create_access_token(user.user_id)
     new_refresh = create_refresh_token(user.user_id)
     attach_auth_cookies(response, new_access, new_refresh)
-    if auth_return_tokens_in_body():
-        return RefreshOkResponse(
-            ok=True,
-            access_token=new_access,
-            refresh_token=new_refresh,
-            token_type="bearer",
-            profile=_auth_me_response(user),
-        )
-    return RefreshOkResponse(ok=True)
+    return RefreshOkResponse(
+        ok=True,
+        access_token=new_access,
+        refresh_token=new_refresh,
+        token_type="bearer",
+        profile=_auth_me_response(user),
+    )
 
 
 # --- Tasks (protected by TaskAuthMiddleware + Depends(get_current_user)) ---

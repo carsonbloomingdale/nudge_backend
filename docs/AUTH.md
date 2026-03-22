@@ -72,7 +72,7 @@ Phones often enforce **stricter third-party / cross-site cookie rules** (e.g. Sa
 
 **Preferred fix:** route API through the **same site** as the SPA (reverse proxy) so cookies are **first-party**.
 
-**Backend fallback:** set **`AUTH_RETURN_TOKENS_IN_BODY=true`** on the API. Then **`POST /auth/login`**, **`POST /auth/register`**, and **`POST /auth/refresh`** also return **`access_token`** and **`refresh_token`** in JSON (when enabled). The SPA should:
+**Backend fallback:** **`POST /auth/login`**, **`POST /auth/register`**, and **`POST /auth/refresh`** always return **`access_token`** and **`refresh_token`** in JSON (alongside `Set-Cookie`) so the SPA can store **`nudge_access_token`** (or similar) and use **`Authorization: Bearer`** when cookies are not sent (e.g. Safari / ITP). The SPA should:
 
 1. Store tokens in **memory** or **sessionStorage** (not localStorage if you can avoid it).
 2. Send **`Authorization: Bearer <access_token>`** on API calls (middleware and `get_current_user` already accept Bearer).
@@ -86,9 +86,9 @@ Phones often enforce **stricter third-party / cross-site cookie rules** (e.g. Sa
 
 ### Cold load
 
-1. **`POST /auth/refresh`** — with cookies (`credentials: 'include'`) **or**, on mobile, JSON body `{ "refresh_token": "..." }` if you use **`AUTH_RETURN_TOKENS_IN_BODY`** and stored refresh.
+1. **`POST /auth/refresh`** — with cookies (`credentials: 'include'`) **or** JSON body `{ "refresh_token": "..." }` when the refresh cookie is missing (use the refresh from login/refresh JSON).
 2. **401** → treat as **logged out** (no valid refresh).
-3. **200** → new `Set-Cookie` for access + refresh; if **`AUTH_RETURN_TOKENS_IN_BODY`**, update stored tokens from the JSON body.
+3. **200** → new `Set-Cookie` for access + refresh; update stored tokens from the JSON body (`access_token`, `refresh_token`).
 
 ### Login
 
@@ -158,7 +158,6 @@ Middleware + `Depends(get_current_user)` enforce auth on:
 | `AUTH_COOKIE_DOMAIN` | No | Optional e.g. `.example.com`. |
 | `AUTH_ACCESS_COOKIE_NAME` | No | Override access cookie name. |
 | `AUTH_REFRESH_COOKIE_NAME` | No | Override refresh cookie name. |
-| `AUTH_RETURN_TOKENS_IN_BODY` | No (`false`) | If `true`, login/register/refresh also return JWTs in JSON for **`Authorization: Bearer`** (mobile / cookie issues). |
 
 ---
 
