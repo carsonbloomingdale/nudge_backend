@@ -33,6 +33,7 @@ class Person(Base):
     user_name= Column(String)
     user_id= mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email=Column(String)
+    password_hash = Column(String, nullable=True)
     person_tasks = relationship(
         "Task",
         primaryjoin="and_(Task.user_id==Person.user_id)",
