@@ -9,8 +9,9 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Load from repo root (not cwd — fixes uvicorn/Cursor when cwd ≠ project dir)
 _ROOT = Path(__file__).resolve().parent
-load_dotenv(_ROOT / ".env")
-load_dotenv(_ROOT / ".env.local", override=True)
+if os.getenv("NUDGE_TESTING", "").lower() not in ("1", "true", "yes"):
+    load_dotenv(_ROOT / ".env")
+    load_dotenv(_ROOT / ".env.local", override=True)
 
 
 def _normalize_database_url(raw: str | None) -> str:
@@ -50,8 +51,17 @@ except Exception as exc:
     ) from exc
 
 is_sqlite = DATABASE_URL.startswith("sqlite")
-connect_args = {"check_same_thread": False} if is_sqlite else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+if is_sqlite and ":memory:" in DATABASE_URL:
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+else:
+    connect_args = {"check_same_thread": False} if is_sqlite else {}
+    engine = create_engine(DATABASE_URL, connect_args=connect_args)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -69,3 +79,38 @@ def ensure_auth_columns(engine) -> None:
         return
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE person ADD COLUMN password_hash VARCHAR"))
+
+
+def ensure_person_profile_columns(engine) -> None:
+    """Add optional profile / SMS-prep columns (additive ALTERs only)."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    if not insp.has_table("person"):
+        return
+    cols = {c["name"] for c in insp.get_columns("person")}
+    is_sqlite = engine.dialect.name == "sqlite"
+    stmts: list[str] = []
+    if "first_name" not in cols:
+        stmts.append("ALTER TABLE person ADD COLUMN first_name VARCHAR(128)")
+    if "last_name" not in cols:
+        stmts.append("ALTER TABLE person ADD COLUMN last_name VARCHAR(128)")
+    if "phone_e164" not in cols:
+        stmts.append("ALTER TABLE person ADD COLUMN phone_e164 VARCHAR(20)")
+    if "timezone" not in cols:
+        stmts.append("ALTER TABLE person ADD COLUMN timezone VARCHAR(64)")
+    if "sms_opt_in" not in cols:
+        if is_sqlite:
+            stmts.append("ALTER TABLE person ADD COLUMN sms_opt_in INTEGER NOT NULL DEFAULT 0")
+        else:
+            stmts.append("ALTER TABLE person ADD COLUMN sms_opt_in BOOLEAN NOT NULL DEFAULT false")
+    if "phone_verified_at" not in cols:
+        if is_sqlite:
+            stmts.append("ALTER TABLE person ADD COLUMN phone_verified_at DATETIME")
+        else:
+            stmts.append("ALTER TABLE person ADD COLUMN phone_verified_at TIMESTAMPTZ")
+    if not stmts:
+        return
+    with engine.begin() as conn:
+        for sql in stmts:
+            conn.execute(text(sql))

@@ -1,10 +1,13 @@
+import re
+from datetime import datetime
 from typing import List, Annotated, Any, Literal, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from uuid import UUID
-from database import SessionLocal, engine, ensure_auth_columns
+from database import SessionLocal, engine, ensure_auth_columns, ensure_person_profile_columns
 import models
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError
@@ -180,6 +183,42 @@ class AuthMeResponse(BaseModel):
     username: str
     user_name: str
     email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone_e164: Optional[str] = None
+    timezone: Optional[str] = None
+    sms_opt_in: bool = False
+    phone_verified_at: Optional[datetime] = None
+
+
+_PHONE_E164_RE = re.compile(r"^\+[1-9]\d{1,14}$")
+
+
+def _normalize_optional_e164(v: Any) -> Optional[str]:
+    if v is None or v == "":
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if not _PHONE_E164_RE.fullmatch(s):
+        raise ValueError(
+            "phone_e164 must be E.164 (+ and digits, max 15 digits after +). "
+            "Numbers are unverified until SMS verification is implemented."
+        )
+    return s
+
+
+def _normalize_optional_timezone(v: Any) -> Optional[str]:
+    if v is None or v == "":
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        ZoneInfo(s)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError("timezone must be a valid IANA timezone name (e.g. America/New_York)") from exc
+    return s
 
 
 class RegisterRequest(BaseModel):
@@ -190,6 +229,11 @@ class RegisterRequest(BaseModel):
         max_length=128,
         description="Minimum 8 characters (align with FE validation).",
     )
+    first_name: Optional[str] = Field(None, max_length=128)
+    last_name: Optional[str] = Field(None, max_length=128)
+    phone_e164: Optional[str] = None
+    timezone: Optional[str] = Field(None, max_length=64)
+    sms_opt_in: bool = False
 
     @field_validator("username")
     @classmethod
@@ -203,6 +247,71 @@ class RegisterRequest(BaseModel):
     @classmethod
     def email_norm(cls, v: str) -> str:
         return v.strip().lower()
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def register_names(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        return s if s else None
+
+    @field_validator("phone_e164")
+    @classmethod
+    def register_phone(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_optional_e164(v)
+
+    @field_validator("timezone")
+    @classmethod
+    def register_timezone(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_optional_timezone(v)
+
+
+class PatchMeRequest(BaseModel):
+    """PATCH /auth/me — only fields present in the body are updated (partial update)."""
+
+    first_name: Optional[str] = Field(None, max_length=128)
+    last_name: Optional[str] = Field(None, max_length=128)
+    phone_e164: Optional[str] = None
+    timezone: Optional[str] = Field(None, max_length=64)
+    sms_opt_in: Optional[bool] = None
+    email: Optional[str] = Field(None, min_length=3, max_length=254)
+    username: Optional[str] = Field(None, min_length=1, max_length=128)
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def patch_names(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        return s if s else None
+
+    @field_validator("phone_e164")
+    @classmethod
+    def patch_phone(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_optional_e164(v)
+
+    @field_validator("timezone")
+    @classmethod
+    def patch_timezone(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_optional_timezone(v)
+
+    @field_validator("email")
+    @classmethod
+    def patch_email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return v.strip().lower()
+
+    @field_validator("username")
+    @classmethod
+    def patch_username(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            raise ValueError("username cannot be blank")
+        return s
 
 
 class LoginRequest(BaseModel):
@@ -284,6 +393,7 @@ db_dependency = Annotated[Session, Depends(get_db)]
 
 models.Base.metadata.create_all(bind=engine)
 ensure_auth_columns(engine)
+ensure_person_profile_columns(engine)
 
 
 def get_current_user(request: Request, db: db_dependency) -> models.Person:
@@ -315,6 +425,25 @@ def get_current_user(request: Request, db: db_dependency) -> models.Person:
 
 
 CurrentUser = Annotated[models.Person, Depends(get_current_user)]
+
+
+def _auth_me_response(user: models.Person) -> AuthMeResponse:
+    uid = user.user_id
+    sid = str(uid)
+    return AuthMeResponse(
+        id=uid,
+        user_id=uid,
+        sub=sid,
+        username=user.user_name,
+        user_name=user.user_name,
+        email=user.email or "",
+        first_name=user.first_name,
+        last_name=user.last_name,
+        phone_e164=user.phone_e164,
+        timezone=user.timezone,
+        sms_opt_in=bool(user.sms_opt_in),
+        phone_verified_at=user.phone_verified_at,
+    )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -582,6 +711,11 @@ async def auth_register(body: RegisterRequest, db: db_dependency, response: Resp
         user_name=body.username,
         email=body.email,
         password_hash=hash_password(body.password),
+        first_name=body.first_name,
+        last_name=body.last_name,
+        phone_e164=body.phone_e164,
+        timezone=body.timezone,
+        sms_opt_in=body.sms_opt_in,
     )
     db.add(person)
     db.commit()
@@ -621,16 +755,47 @@ async def auth_logout(response: Response):
 @app.get("/auth/me", response_model=AuthMeResponse)
 async def auth_me(user: CurrentUser):
     """Current session profile (requires access cookie or Bearer)."""
-    uid = user.user_id
-    sid = str(uid)
-    return AuthMeResponse(
-        id=uid,
-        user_id=uid,
-        sub=sid,
-        username=user.user_name,
-        user_name=user.user_name,
-        email=user.email or "",
-    )
+    return _auth_me_response(user)
+
+
+@app.patch("/auth/me", response_model=AuthMeResponse)
+async def auth_patch_me(user: CurrentUser, body: PatchMeRequest, db: db_dependency):
+    """Partial profile update (allowlisted fields only)."""
+    updates = body.model_dump(exclude_unset=True)
+    if "username" in updates:
+        updates["user_name"] = updates.pop("username")
+    if "user_name" in updates:
+        taken = (
+            db.query(models.Person)
+            .filter(
+                models.Person.user_name == updates["user_name"],
+                models.Person.user_id != user.user_id,
+            )
+            .first()
+        )
+        if taken:
+            raise HTTPException(status_code=409, detail="Username already exists")
+    if "email" in updates:
+        taken = (
+            db.query(models.Person)
+            .filter(
+                models.Person.email == updates["email"],
+                models.Person.user_id != user.user_id,
+            )
+            .first()
+        )
+        if taken:
+            raise HTTPException(status_code=409, detail="Email already registered")
+    if "phone_e164" in updates:
+        new_phone = updates["phone_e164"]
+        if new_phone != user.phone_e164:
+            updates["phone_verified_at"] = None
+    for key, val in updates.items():
+        setattr(user, key, val)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _auth_me_response(user)
 
 
 @app.post("/auth/refresh", response_model=RefreshOkResponse, response_model_exclude_none=True)
