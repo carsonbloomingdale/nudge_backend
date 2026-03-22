@@ -1,12 +1,13 @@
 from typing import List, Annotated, Any, Optional
 
 from sqlalchemy.orm import Session
-from fastapi import FastAPI, HTTPException, Depends, Request
-from pydantic import BaseModel, Field, ConfigDict, field_validator
-from uuid import UUID, uuid4
-from database import SessionLocal, engine
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from uuid import UUID
+from database import SessionLocal, engine, ensure_auth_columns
 import models
 from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError
 import asyncio
 import json
 import os
@@ -17,32 +18,67 @@ from collections import defaultdict, deque
 from threading import Lock
 from urllib import error, request
 
-
-def _parse_cors_origins() -> List[str]:
-    """Comma-separated URLs, or * for all. Example: http://localhost:3000,https://app.example.com"""
-    raw = (os.getenv("CORS_ORIGINS") or "*").strip()
-    if not raw or raw == "*":
-        return ["*"]
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
-
-
-app = FastAPI()
-
-_cors_origins = _parse_cors_origins()
-_allow_credentials = False if _cors_origins == ["*"] else True
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=_allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from auth_middleware import TaskAuthMiddleware
+from auth_tokens import (
+    attach_auth_cookies,
+    auth_configured,
+    clear_auth_cookies,
+    create_access_token,
+    create_refresh_token,
+    COOKIE_REFRESH_NAME,
+    decode_token,
+    get_access_token_from_request,
+    hash_password,
+    verify_password,
 )
+
+
+def _parse_cors_config() -> tuple[list[str], Optional[str], bool]:
+    """
+    Browsers send an exact `Origin` (scheme + host + port, no path, usually no trailing slash).
+    `CORS_ORIGINS` must match that string exactly — we strip whitespace and trailing `/` on each entry.
+    Optional `CORS_ORIGIN_REGEX` (full match) helps preview deploys, e.g. https://.*\\.vercel\\.app
+    """
+    raw = (os.getenv("CORS_ORIGINS") or "*").strip()
+    regex = (os.getenv("CORS_ORIGIN_REGEX") or "").strip() or None
+
+    if not raw or raw == "*":
+        origins: list[str] = [] if regex else ["*"]
+    else:
+        origins = []
+        for part in raw.split(","):
+            o = part.strip().rstrip("/")
+            if o:
+                origins.append(o)
+
+    # Credentials + cookie auth require explicit origins (not *) so Allow-Origin can echo the request Origin.
+    allow_credentials = not (origins == ["*"] and regex is None)
+
+    return origins, regex, allow_credentials
+
+
+app = FastAPI(title="Nudge API")
+
+_cors_origins, _cors_origin_regex, _allow_credentials = _parse_cors_config()
+
+_cors_kwargs: dict = {
+    "allow_credentials": _allow_credentials,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if _cors_origin_regex:
+    _cors_kwargs["allow_origin_regex"] = _cors_origin_regex
+_cors_kwargs["allow_origins"] = _cors_origins if _cors_origins else []
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
+app.add_middleware(TaskAuthMiddleware)
+
 
 class PersonalityTrait(BaseModel):
     label: str
     task_id: int
     trait_id: int
+
 
 class TaskBase(BaseModel):
     sentiment: str
@@ -54,24 +90,39 @@ class TaskBase(BaseModel):
     amount_of_time: str
     day_of_week: str
 
+
+class TaskCreateBody(BaseModel):
+    """POST /tasks/ body — user comes from JWT only (do not trust client user_id)."""
+
+    sentiment: str
+    category: str
+    label: str
+    context: str
+    time_of_day: str
+    amount_of_time: str
+    day_of_week: str
+
+
 class TaskModel(TaskBase):
     task_id: int
-    
+
     model_config = ConfigDict(from_attributes=True)
+
 
 class PersonBase(BaseModel):
     user_name: str
     email: str
     person_tasks: List[TaskModel]
 
+
 class PersonModel(PersonBase):
     user_id: UUID
-    
+
     model_config = ConfigDict(from_attributes=True)
 
 
 class CreateUserRequest(BaseModel):
-    """Body for POST /users/ — register by username only."""
+    """Legacy username-only signup (no password). Prefer POST /auth/register."""
 
     username: str = Field(min_length=1, max_length=128)
 
@@ -82,6 +133,75 @@ class CreateUserRequest(BaseModel):
         if not s:
             raise ValueError("username cannot be blank")
         return s
+
+
+class UserPublic(BaseModel):
+    user_id: UUID
+    user_name: str
+    email: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AuthMeResponse(BaseModel):
+    """Profile for SPA — map from `id` / `user_id` / `sub`; `username` mirrors `user_name`."""
+
+    id: UUID
+    user_id: UUID
+    sub: str
+    username: str
+    user_name: str
+    email: str
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(
+        min_length=8,
+        max_length=128,
+        description="Minimum 8 characters (align with FE validation).",
+    )
+
+    @field_validator("username")
+    @classmethod
+    def username_strip(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("username cannot be blank")
+        return s
+
+    @field_validator("email")
+    @classmethod
+    def email_norm(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+class LoginRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+    email: Optional[str] = None
+    username: Optional[str] = None
+
+    @model_validator(mode="after")
+    def need_identifier(self) -> "LoginRequest":
+        if not (self.email or self.username):
+            raise ValueError("Provide email or username")
+        return self
+
+    @field_validator("email")
+    @classmethod
+    def email_opt_norm(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        return v.strip().lower()
+
+    @field_validator("username")
+    @classmethod
+    def username_opt_strip(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        s = v.strip()
+        return s or None
 
 
 class OpenAIRequestMeta(BaseModel):
@@ -123,16 +243,50 @@ class SuggestionResponse(BaseModel):
     suggestion: SuggestionPayload
     meta: OpenAIRequestMeta
 
+
 def get_db():
     db = SessionLocal()
     try:
         yield db
-    finally: 
+    finally:
         db.close()
+
 
 db_dependency = Annotated[Session, Depends(get_db)]
 
 models.Base.metadata.create_all(bind=engine)
+ensure_auth_columns(engine)
+
+
+def get_current_user(request: Request, db: db_dependency) -> models.Person:
+    if not auth_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is not configured (set JWT_SECRET_KEY, min 32 chars).",
+        )
+    token = get_access_token_from_request(request)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        payload = decode_token(token, expected_type="access")
+        uid = UUID(payload["sub"])
+    except (JWTError, ValueError, KeyError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = db.query(models.Person).filter(models.Person.user_id == uid).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return user
+
+
+CurrentUser = Annotated[models.Person, Depends(get_current_user)]
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -220,9 +374,12 @@ def _normalize_enriched_task(raw_payload: dict[str, Any], original_task: str) ->
         category=str(payload.get("category", "other")).strip()[:80] or "other",
         label=label[:200],
         context=str(payload.get("context", "")).strip()[:300],
-        time_of_day=str(payload.get("time_of_day", payload.get("timeOfDay", "unspecified"))).strip()[:40] or "unspecified",
-        amount_of_time=str(payload.get("amount_of_time", payload.get("amountOfTime", "unspecified"))).strip()[:40] or "unspecified",
-        day_of_week=str(payload.get("day_of_week", payload.get("dayOfWeek", "unspecified"))).strip()[:40] or "unspecified",
+        time_of_day=str(payload.get("time_of_day", payload.get("timeOfDay", "unspecified"))).strip()[:40]
+        or "unspecified",
+        amount_of_time=str(payload.get("amount_of_time", payload.get("amountOfTime", "unspecified"))).strip()[:40]
+        or "unspecified",
+        day_of_week=str(payload.get("day_of_week", payload.get("dayOfWeek", "unspecified"))).strip()[:40]
+        or "unspecified",
         personality_traits=normalized_traits[:5],
     )
 
@@ -296,7 +453,6 @@ async def _openai_chat_completion(system_prompt: str, user_prompt: str) -> tuple
             except json.JSONDecodeError:
                 pass
 
-            # Rate / quota limits — retry with backoff, then surface 429 to the client
             if exc.code == 429:
                 last_error = exc
                 if attempt < OPENAI_RETRIES:
@@ -332,7 +488,7 @@ async def _openai_chat_completion(system_prompt: str, user_prompt: str) -> tuple
             last_error = exc
 
         if attempt < OPENAI_RETRIES:
-            await asyncio.sleep((2 ** attempt) * 0.5 + random.uniform(0, 0.2))
+            await asyncio.sleep((2**attempt) * 0.5 + random.uniform(0, 0.2))
 
     raise HTTPException(status_code=502, detail=f"OpenAI request failed after retries: {last_error}")
 
@@ -374,13 +530,160 @@ def _build_suggestion_prompts(task_history: List[dict[str, Any]]) -> tuple[str, 
     )
     return system_prompt, user_prompt
 
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# --- Auth (password + JWT in httpOnly cookies; Bearer header also supported) ---
+
+
+@app.post("/auth/register", response_model=UserPublic)
+async def auth_register(body: RegisterRequest, db: db_dependency, response: Response):
+    if not auth_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Set JWT_SECRET_KEY (min 32 chars) to enable authentication.",
+        )
+    if db.query(models.Person).filter(models.Person.user_name == body.username).first():
+        raise HTTPException(status_code=409, detail="Username already exists")
+    if db.query(models.Person).filter(models.Person.email == body.email).first():
+        raise HTTPException(status_code=409, detail="Email already registered")
+    person = models.Person(
+        user_name=body.username,
+        email=body.email,
+        password_hash=hash_password(body.password),
+    )
+    db.add(person)
+    db.commit()
+    db.refresh(person)
+    attach_auth_cookies(
+        response,
+        create_access_token(person.user_id),
+        create_refresh_token(person.user_id),
+    )
+    return person
+
+
+@app.post("/auth/login", response_model=UserPublic)
+async def auth_login(body: LoginRequest, db: db_dependency, response: Response):
+    if not auth_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Set JWT_SECRET_KEY (min 32 chars) to enable authentication.",
+        )
+    user: Optional[models.Person] = None
+    if body.email:
+        user = db.query(models.Person).filter(models.Person.email == body.email).first()
+    elif body.username:
+        user = db.query(models.Person).filter(models.Person.user_name == body.username).first()
+    if user is None or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    attach_auth_cookies(
+        response,
+        create_access_token(user.user_id),
+        create_refresh_token(user.user_id),
+    )
+    return user
+
+
+@app.post("/auth/logout")
+async def auth_logout(response: Response):
+    clear_auth_cookies(response)
+    return {"ok": True}
+
+
+@app.get("/auth/me", response_model=AuthMeResponse)
+async def auth_me(user: CurrentUser):
+    """Current session profile (requires access cookie or Bearer)."""
+    uid = user.user_id
+    sid = str(uid)
+    return AuthMeResponse(
+        id=uid,
+        user_id=uid,
+        sub=sid,
+        username=user.user_name,
+        user_name=user.user_name,
+        email=user.email or "",
+    )
+
+
+@app.post("/auth/refresh")
+async def auth_refresh(request: Request, response: Response, db: db_dependency):
+    if not auth_configured():
+        raise HTTPException(status_code=503, detail="Authentication is not configured.")
+    rt = request.cookies.get(COOKIE_REFRESH_NAME)
+    if not rt:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+    try:
+        payload = decode_token(rt, expected_type="refresh")
+        uid = UUID(payload["sub"])
+    except (JWTError, ValueError, KeyError):
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+    user = db.query(models.Person).filter(models.Person.user_id == uid).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    attach_auth_cookies(
+        response,
+        create_access_token(user.user_id),
+        create_refresh_token(user.user_id),
+    )
+    return {"ok": True}
+
+
+# --- Tasks (protected by TaskAuthMiddleware + Depends(get_current_user)) ---
+
+
 @app.post("/tasks/", response_model=TaskModel)
-async def create_task(task: TaskBase, db: db_dependency):
-    db_transaction = models.Task(**task.dict())
+async def create_task(body: TaskCreateBody, db: db_dependency, user: CurrentUser):
+    data = body.model_dump()
+    data["user_id"] = user.user_id
+    db_transaction = models.Task(**data)
     db.add(db_transaction)
     db.commit()
     db.refresh(db_transaction)
     return db_transaction
+
+
+@app.get("/tasks", response_model=List[TaskModel])
+@app.get("/tasks/", response_model=List[TaskModel])
+async def read_tasks(db: db_dependency, user: CurrentUser, skip: int = 0, limit: int = 100):
+    tasks = (
+        db.query(models.Task)
+        .filter(models.Task.user_id == user.user_id)
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    return tasks
+
+
+@app.post("/api/tasks/enrich", response_model=EnrichTaskResponse)
+async def enrich_task(body: EnrichTaskRequest, request: Request, user: CurrentUser):
+    _ = user
+    client_key = f"{request.client.host if request.client else 'unknown'}:/api/tasks/enrich"
+    _enforce_rate_limit(client_key)
+
+    system_prompt, user_prompt = _build_enrich_prompts(body.task, body.taskHistory)
+    raw_payload, retries_used = await _openai_chat_completion(system_prompt, user_prompt)
+    normalized = _normalize_enriched_task(raw_payload, body.task)
+    return EnrichTaskResponse(task=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
+
+
+@app.post("/api/suggestions", response_model=SuggestionResponse)
+async def create_suggestion(body: SuggestionRequest, request: Request, user: CurrentUser):
+    _ = user
+    client_key = f"{request.client.host if request.client else 'unknown'}:/api/suggestions"
+    _enforce_rate_limit(client_key)
+
+    system_prompt, user_prompt = _build_suggestion_prompts(body.taskHistory)
+    raw_payload, retries_used = await _openai_chat_completion(system_prompt, user_prompt)
+    normalized = _normalize_suggestion(raw_payload)
+    return SuggestionResponse(suggestion=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
+
+
+# --- Users (public lookups / legacy signup) ---
 
 
 @app.post("/users/", response_model=PersonModel)
@@ -389,23 +692,17 @@ async def create_user(body: CreateUserRequest, db: db_dependency):
     existing = db.query(models.Person).filter(models.Person.user_name == username).first()
     if existing is not None:
         raise HTTPException(status_code=409, detail="Username already exists")
-    # email unused by current clients; column exists on model — store empty string
-    person = models.Person(user_name=username, email="")
+    person = models.Person(user_name=username, email="", password_hash=None)
     db.add(person)
     db.commit()
     db.refresh(person)
     return person
 
+
 @app.get("/users", response_model=List[PersonModel])
 async def read_users(db: db_dependency, skip: int = 0, limit: int = 100):
     users = db.query(models.Person).offset(skip).limit(limit).all()
     return users
-
-
-@app.get("/tasks", response_model=List[TaskModel])
-async def read_tasks(db: db_dependency, skip: int = 0, limit: int = 100):
-    tasks = db.query(models.Task).offset(skip).limit(limit).all()
-    return tasks
 
 
 @app.get("/user_by_id/{user_id}", response_model=PersonModel)
@@ -429,28 +726,6 @@ async def user_by_user_name(username: str, db: db_dependency):
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return user
-
-
-@app.post("/api/tasks/enrich", response_model=EnrichTaskResponse)
-async def enrich_task(body: EnrichTaskRequest, request: Request):
-    client_key = f"{request.client.host if request.client else 'unknown'}:/api/tasks/enrich"
-    _enforce_rate_limit(client_key)
-
-    system_prompt, user_prompt = _build_enrich_prompts(body.task, body.taskHistory)
-    raw_payload, retries_used = await _openai_chat_completion(system_prompt, user_prompt)
-    normalized = _normalize_enriched_task(raw_payload, body.task)
-    return EnrichTaskResponse(task=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
-
-
-@app.post("/api/suggestions", response_model=SuggestionResponse)
-async def create_suggestion(body: SuggestionRequest, request: Request):
-    client_key = f"{request.client.host if request.client else 'unknown'}:/api/suggestions"
-    _enforce_rate_limit(client_key)
-
-    system_prompt, user_prompt = _build_suggestion_prompts(body.taskHistory)
-    raw_payload, retries_used = await _openai_chat_completion(system_prompt, user_prompt)
-    normalized = _normalize_suggestion(raw_payload)
-    return SuggestionResponse(suggestion=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
 
 
 if __name__ == "__main__":

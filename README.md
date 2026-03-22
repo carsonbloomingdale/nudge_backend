@@ -1,13 +1,20 @@
 # nudge_backend
 
+## Authentication
+
+See **[docs/AUTH.md](docs/AUTH.md)** — JWT in HTTP-only cookies, `POST /auth/register`, `/auth/login`, `/auth/refresh`, and protected task routes.
+
+Copy `.env.example` to `.env` / `.env.local` and set **`JWT_SECRET_KEY`** (≥32 characters) to enable auth.
+
 ## Environment variables
 
-Copy `.env.example` to `.env` and set values. The app loads `.env` automatically via `python-dotenv` (see `database.py`).
+Copy `.env.example` to `.env` and set values. The app loads **`.env`** then **`.env.local`** from the **repo root** (see `database.py`), not only the current working directory.
 
 | Variable | Purpose |
 |----------|---------|
 | `DATABASE_URL` | SQLite (default) or Postgres URL (`postgres://` is normalized to `postgresql://`) |
 | `CORS_ORIGINS` | Comma-separated allowed origins, or `*` for any (wildcard disables credentialed CORS) |
+| `JWT_SECRET_KEY` | Required for auth (≥ 32 chars); see `docs/AUTH.md` |
 | `OPENAI_API_KEY` | Required for OpenAI-backed routes |
 | `PORT` | Used when starting with `python main.py` |
 

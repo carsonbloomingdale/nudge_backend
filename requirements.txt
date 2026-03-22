@@ -17,3 +17,5 @@ watchfiles==1.1.1
 websockets==15.0.1
 sqlalchemy==2.0.43
 psycopg[binary]==3.2.10
+python-jose[cryptography]==3.3.0
+bcrypt==4.2.1
