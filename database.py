@@ -61,7 +61,17 @@ if is_sqlite and ":memory:" in DATABASE_URL:
     )
 else:
     connect_args = {"check_same_thread": False} if is_sqlite else {}
-    engine = create_engine(DATABASE_URL, connect_args=connect_args)
+    # Heroku Postgres (and similar) may close idle connections or cycle during maintenance.
+    # Without pre-ping, a dead connection can be reused from the pool and raise AdminShutdown.
+    if is_sqlite:
+        engine = create_engine(DATABASE_URL, connect_args=connect_args)
+    else:
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args=connect_args,
+            pool_pre_ping=True,
+            pool_recycle=300,
+        )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
