@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, Field, ConfigDict, computed_field, field_validator, model_validator
 from uuid import UUID
 from database import DbSession, engine, ensure_auth_columns, ensure_person_profile_columns
 from openai_client import OPENAI_MODEL, OPENAI_SUGGESTION_TEMPERATURE, openai_chat_completion
@@ -151,43 +151,12 @@ class CreateUserRequest(BaseModel):
         return s
 
 
-class UserPublic(BaseModel):
-    user_id: UUID
-    user_name: str
-    email: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class AuthSessionResponse(UserPublic):
-    """Same as UserPublic; optional token fields when AUTH_RETURN_TOKENS_IN_BODY is enabled."""
-
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    token_type: Optional[Literal["bearer"]] = None
-
-
-class RefreshOkResponse(BaseModel):
-    ok: bool = True
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    token_type: Optional[Literal["bearer"]] = None
-
-
 class SmsTestResponse(BaseModel):
     ok: bool = True
 
 
-def _auth_session_response(person: models.Person, access: str, refresh: str) -> AuthSessionResponse:
-    base = UserPublic.model_validate(person).model_dump()
-    if auth_return_tokens_in_body():
-        return AuthSessionResponse(
-            **base,
-            access_token=access,
-            refresh_token=refresh,
-            token_type="bearer",
-        )
-    return AuthSessionResponse(**base)
+class PhoneOtpVerifyBody(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
 class AuthMeResponse(BaseModel):
@@ -205,6 +174,29 @@ class AuthMeResponse(BaseModel):
     timezone: Optional[str] = None
     sms_opt_in: bool = False
     phone_verified_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @computed_field
+    @property
+    def phone_verified(self) -> bool:
+        return self.phone_verified_at is not None
+
+
+class AuthSessionResponse(AuthMeResponse):
+    """Same fields as GET /auth/me plus optional tokens when AUTH_RETURN_TOKENS_IN_BODY is enabled."""
+
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[Literal["bearer"]] = None
+
+
+class RefreshOkResponse(BaseModel):
+    ok: bool = True
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[Literal["bearer"]] = None
+    profile: Optional[AuthMeResponse] = None
 
 
 _PHONE_E164_RE = re.compile(r"^\+[1-9]\d{1,14}$")
@@ -453,6 +445,20 @@ def _auth_me_response(user: models.Person) -> AuthMeResponse:
         phone_verified_at=user.phone_verified_at,
     )
 
+
+def _auth_session_response(person: models.Person, access: str, refresh: str) -> AuthSessionResponse:
+    me = _auth_me_response(person)
+    data = me.model_dump()
+    if auth_return_tokens_in_body():
+        return AuthSessionResponse(
+            **data,
+            access_token=access,
+            refresh_token=refresh,
+            token_type="bearer",
+        )
+    return AuthSessionResponse(**data)
+
+
 RATE_LIMIT_REQUESTS = int(os.getenv("API_RATE_LIMIT_REQUESTS", "20"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _rate_limiter_lock = Lock()
@@ -623,9 +629,6 @@ async def auth_register(body: RegisterRequest, db: db_dependency, response: Resp
     db.add(person)
     db.commit()
     db.refresh(person)
-    from sms_checkin import send_welcome_sms_if_opted_in
-
-    await asyncio.to_thread(send_welcome_sms_if_opted_in, person.phone_e164, bool(person.sms_opt_in))
     access = create_access_token(person.user_id)
     refresh = create_refresh_token(person.user_id)
     attach_auth_cookies(response, access, refresh)
@@ -664,6 +667,58 @@ async def auth_me(user: CurrentUser):
     return _auth_me_response(user)
 
 
+@app.post("/auth/me/phone/send-verification-code", response_model=AuthMeResponse)
+async def auth_me_phone_send_verification_code(user: CurrentUser, db: db_dependency):
+    """Send or start SMS verification for profile phone_e164.
+
+    With `TWILIO_VERIFY_SERVICE_SID`, uses Twilio Verify (recommended). Otherwise sends a custom
+    Programmable SMS body (may require toll-free verification for that sender).
+    """
+    from phone_sms_verify import send_phone_verification
+    from sms_checkin import SmsUpstreamError
+
+    try:
+        send_phone_verification(db, user)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError:
+        raise HTTPException(
+            status_code=503,
+            detail="SMS is not configured on this server.",
+        )
+    except SmsUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Phone OTP send failed user_id=%s", user.user_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not send verification text. Try again later.",
+        )
+    db.refresh(user)
+    return _auth_me_response(user)
+
+
+@app.post("/auth/me/phone/verify", response_model=AuthMeResponse)
+async def auth_me_phone_verify(user: CurrentUser, db: db_dependency, body: PhoneOtpVerifyBody):
+    """Submit the 6-digit code from SMS; sets phone_verified_at and may send welcome SMS if sms_opt_in."""
+    if user.phone_verified_at is not None:
+        raise HTTPException(status_code=400, detail="Phone number is already verified")
+    from phone_sms_verify import verify_phone_code
+    from sms_checkin import send_welcome_sms_if_opted_in
+
+    ok = verify_phone_code(db, user, body.code)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+    db.refresh(user)
+    await asyncio.to_thread(
+        send_welcome_sms_if_opted_in,
+        user.phone_e164,
+        bool(user.sms_opt_in),
+        user.phone_verified_at,
+    )
+    return _auth_me_response(user)
+
+
 @app.post("/auth/me/sms/test", response_model=SmsTestResponse)
 async def auth_me_sms_test(user: CurrentUser):
     """Send a test SMS to the signed-in user's phone (profile must have SMS enabled + E.164 phone)."""
@@ -672,13 +727,18 @@ async def auth_me_sms_test(user: CurrentUser):
             status_code=400,
             detail="Turn on SMS notifications in your profile to send a test message.",
         )
+    if user.phone_verified_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Verify your phone number first (POST /auth/me/phone/send-verification-code, then /verify).",
+        )
     phone = (user.phone_e164 or "").strip()
     if not phone:
         raise HTTPException(
             status_code=400,
             detail="Add a phone number (E.164) to your profile first.",
         )
-    from sms_checkin import send_account_test_sms
+    from sms_checkin import SmsUpstreamError, send_account_test_sms
 
     try:
         await asyncio.to_thread(send_account_test_sms, phone)
@@ -689,6 +749,8 @@ async def auth_me_sms_test(user: CurrentUser):
             status_code=503,
             detail="SMS is not configured on this server.",
         )
+    except SmsUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception:
         logger.exception("Test SMS failed user_id=%s", user.user_id)
         raise HTTPException(
@@ -769,6 +831,7 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
             access_token=new_access,
             refresh_token=new_refresh,
             token_type="bearer",
+            profile=_auth_me_response(user),
         )
     return RefreshOkResponse(ok=True)
 

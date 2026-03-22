@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 import pytest
@@ -36,6 +36,13 @@ def sms_profile(client, register_user):
             "sms_opt_in": True,
         },
     )
+    db = SessionLocal()
+    try:
+        u = db.query(models.Person).filter(models.Person.user_name == username).one()
+        u.phone_verified_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
     return token, username, phone
 
 

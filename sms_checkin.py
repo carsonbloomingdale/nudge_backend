@@ -2,6 +2,17 @@
 Daily SMS check-in (Twilio): 5pm local send, inbound reply → Task rows.
 See .env.example for TWILIO_* and SCHEDULER_SECRET.
 
+US toll-free (and some numbers): Twilio requires Console verification for your **sending**
+identity before outbound SMS succeeds — see
+https://www.twilio.com/docs/messaging/compliance/toll-free/console-onboarding
+That is not caused by OTP wording; unverified TF affects every Programmable SMS send the same way.
+
+Phone OTP: if `TWILIO_VERIFY_SERVICE_SID` is unset, the 6-digit **expiry is enforced only in our
+database** (`phone_otp_challenge.expires_at`). With Verify, Twilio validates the code; the placeholder
+row in `phone_otp_challenge` is only for rate limits.
+
+Optional: set TWILIO_MESSAGING_SERVICE_SID to send via a Messaging Service (often how verified toll-free is attached).
+
 Failure modes: reply over SMS_CHECKIN_MAX_BODY_CHARS (rejected, user notified);
 OpenAI missing/mis-parsed JSON → single fallback task from raw text.
 Opt-out: STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT (first word, case-insensitive).
@@ -20,6 +31,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, HTTPException, Request, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
 
 import models
@@ -28,10 +40,18 @@ from openai_client import OPENAI_API_KEY, openai_chat_completion
 
 logger = logging.getLogger(__name__)
 
+
+class SmsUpstreamError(Exception):
+    """Twilio Programmable SMS rejected the request (e.g. unverified toll-free, invalid To)."""
+
+    pass
+
+
 sms_router = APIRouter(tags=["sms"])
 
 TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
 TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
+TWILIO_MESSAGING_SERVICE_SID = (os.getenv("TWILIO_MESSAGING_SERVICE_SID") or "").strip()
 TWILIO_FROM_NUMBER = (
     (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_FROM_NUMBER") or "").strip()
 )
@@ -75,7 +95,9 @@ def _scheduler_secret() -> str:
 
 
 def twilio_configured() -> bool:
-    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER)
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+        return False
+    return bool(TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM_NUMBER)
 
 
 def _public_request_url(request: Request) -> str:
@@ -110,8 +132,10 @@ def _twilio_signature_ok(url: str, params: dict[str, str], signature: str | None
 
 
 def send_twilio_sms(to_e164: str, body: str) -> str:
-    if not twilio_configured():
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
         raise RuntimeError("Twilio is not configured")
+    if not (TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM_NUMBER):
+        raise RuntimeError("Twilio is not configured (set TWILIO_MESSAGING_SERVICE_SID or TWILIO_PHONE_NUMBER)")
     dry = os.getenv("SMS_DRY_RUN", "").lower() in ("1", "true", "yes")
     if dry:
         logger.info("SMS_DRY_RUN skip send to=%s", to_e164)
@@ -119,16 +143,36 @@ def send_twilio_sms(to_e164: str, body: str) -> str:
     from twilio.rest import Client
 
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    msg = client.messages.create(to=to_e164, from_=TWILIO_FROM_NUMBER, body=body)
+    kwargs: dict[str, str] = {"to": to_e164, "body": body}
+    if TWILIO_MESSAGING_SERVICE_SID:
+        kwargs["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
+    else:
+        kwargs["from_"] = TWILIO_FROM_NUMBER
+    try:
+        msg = client.messages.create(**kwargs)
+    except TwilioRestException as exc:
+        logger.warning(
+            "Twilio messages.create failed status=%s code=%s to=%s msg=%s",
+            exc.status,
+            exc.code,
+            to_e164[:12],
+            exc.msg,
+        )
+        suffix = f" (Twilio {exc.code})" if exc.code is not None else ""
+        raise SmsUpstreamError(f"{exc.msg}{suffix}") from exc
     return str(msg.sid)
 
 
-def send_welcome_sms_if_opted_in(phone_e164: Optional[str], sms_opt_in: bool) -> None:
-    """Best-effort welcome SMS on signup; failures are logged only (never raises)."""
+def send_welcome_sms_if_opted_in(
+    phone_e164: Optional[str],
+    sms_opt_in: bool,
+    phone_verified_at: Optional[datetime],
+) -> None:
+    """Best-effort welcome SMS after phone OTP verification; failures are logged only (never raises)."""
     if not sms_opt_in:
         return
     phone = (phone_e164 or "").strip()
-    if not phone:
+    if not phone or phone_verified_at is None:
         return
     if not twilio_configured():
         return
@@ -155,6 +199,7 @@ def run_daily_sms_prompts(db: Session) -> None:
         .filter(
             models.Person.sms_opt_in.is_(True),
             models.Person.phone_e164.isnot(None),
+            models.Person.phone_verified_at.isnot(None),
             models.Person.timezone.isnot(None),
         )
         .all()
@@ -380,6 +425,17 @@ async def twilio_sms_webhook(request: Request, db: DbSession) -> Response:
         return Response(status_code=200)
 
     if not user.sms_opt_in:
+        db.commit()
+        return Response(status_code=200)
+
+    if user.phone_verified_at is None:
+        try:
+            send_twilio_sms(
+                from_num,
+                "Complete phone verification in the Nudge app before check-ins will work.",
+            )
+        except Exception:
+            logger.exception("Unverified-user reply SMS failed")
         db.commit()
         return Response(status_code=200)
 

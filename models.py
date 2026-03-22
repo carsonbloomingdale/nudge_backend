@@ -69,3 +69,15 @@ class SmsInboundDedup(Base):
 
     message_sid = mapped_column(String(64), primary_key=True)
     created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class PhoneOtpChallenge(Base):
+    """Short-lived SMS OTP to prove ownership of phone_e164 before outbound SMS (toll-free / compliance)."""
+
+    __tablename__ = "phone_otp_challenge"
+
+    id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("person.user_id"), nullable=False, index=True)
+    code_hash = mapped_column(String(64), nullable=False)
+    expires_at = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
