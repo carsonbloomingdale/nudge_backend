@@ -6,7 +6,6 @@ Complements Depends(get_current_user), which loads the Person row and enforces o
 from __future__ import annotations
 
 import logging
-import os
 
 from jose import JWTError
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -14,33 +13,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from auth_tokens import (
-    COOKIE_ACCESS_NAME,
     auth_configured,
+    auth_request_debug_context,
     decode_token,
     get_access_token_from_request,
 )
 
-logger = logging.getLogger("nudge.auth")
-
-
-def _auth_denials_logged() -> bool:
-    return os.getenv("AUTH_LOG_DENIALS", "").lower() in ("1", "true", "yes")
-
-
-def _log_task_auth_denial(request: Request, path: str, reason: str) -> None:
-    if not _auth_denials_logged():
-        return
-    auth_h = request.headers.get("authorization") or ""
-    bearer_hint = auth_h.lower().startswith("bearer ") and len(auth_h) > 7
-    cookie_hint = COOKIE_ACCESS_NAME in request.cookies
-    logger.warning(
-        "task_auth_denied method=%s path=%s reason=%s access_cookie_present=%s bearer_header_present=%s",
-        request.method,
-        path,
-        reason,
-        cookie_hint,
-        bearer_hint,
-    )
+logger = logging.getLogger(__name__)
 
 
 def _path_requires_task_auth(path: str) -> bool:
@@ -72,8 +51,16 @@ class TaskAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = get_access_token_from_request(request)
+        client_host = request.client.host if request.client else None
+        debug_ctx = auth_request_debug_context(request)
         if not token:
-            _log_task_auth_denial(request, path, "missing_token")
+            logger.info(
+                "Task auth 401 not_authenticated reason=missing_token method=%s path=%s client=%s detail=%s",
+                request.method,
+                path,
+                client_host,
+                debug_ctx,
+            )
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Not authenticated"},
@@ -81,8 +68,15 @@ class TaskAuthMiddleware(BaseHTTPMiddleware):
             )
         try:
             decode_token(token, expected_type="access")
-        except JWTError:
-            _log_task_auth_denial(request, path, "invalid_or_expired_token")
+        except JWTError as exc:
+            logger.info(
+                "Task auth 401 invalid_token reason=invalid_or_expired_token method=%s path=%s client=%s jwt_error=%s detail=%s",
+                request.method,
+                path,
+                client_host,
+                str(exc),
+                debug_ctx,
+            )
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or expired token"},
