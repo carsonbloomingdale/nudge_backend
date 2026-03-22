@@ -43,7 +43,42 @@ The `Origin` header must match **exactly** (after we trim spaces and a trailing 
 - **`COOKIE_SAMESITE`**
   - Same registrable domain as API (typical reverse proxy): **`lax`** or **`strict`** is often enough.
   - **Different sites** (e.g. SPA on `app.example.com`, API on `api.example.com`): use **`COOKIE_SAMESITE=none`** and **`COOKIE_SECURE=true`**.
-- **`AUTH_COOKIE_DOMAIN`** (optional) — e.g. **`.example.com`** so the browser sends cookies to both `https://app.example.com` and `https://api.example.com`. Only set when you understand cookie scope; wrong values break login.
+- **`AUTH_COOKIE_DOMAIN`** (optional) — e.g. **`.example.com`** so the browser sends cookies to both `https://app.example.com` and `https://api.example.com`. Only set when **SPA and API share a parent registrable domain**. If SPA is **`nudgeweb.app`** and API is **`*.koyeb.app`**, leave **`AUTH_COOKIE_DOMAIN` unset** — the cookie is still stored for the **API host** and sent on `fetch(apiUrl, { credentials: 'include' })` **when** `SameSite=None` + `Secure` are set (see below). Browsers may still restrict **third-party** cookies; if login works but `/tasks/` returns **401**, cookies often aren’t sent on cross-site requests.
+
+### Example: `nudgeweb.app` (SPA) + Koyeb API (`https://your-app-….koyeb.app`)
+
+Set these on the **API** (Koyeb env):
+
+| Variable | Example / value |
+|----------|------------------|
+| **`COOKIE_SECURE`** | **`true`** (HTTPS only) |
+| **`COOKIE_SAMESITE`** | **`none`** (required so the browser includes cookies on cross-origin requests from your SPA) |
+| **`CORS_ORIGINS`** | **`https://nudgeweb.app`** and, if you use it, **`https://www.nudgeweb.app`** (comma-separated, **no** trailing slash, **https** if the site is HTTPS) |
+| **`REACT_APP_API_BASE_URL`** (SPA) | Full API origin, e.g. **`https://your-service.koyeb.app`** — same host the browser uses for `fetch`; no typo, no mixed `http`/`https` |
+
+**Do not** set **`AUTH_COOKIE_DOMAIN`** to `nudgeweb.app` when the API lives on **`koyeb.app`** — that is invalid for cookie `Domain` and will break `Set-Cookie`.
+
+**Sanity-check in DevTools (after `POST /auth/login` or register)**
+
+1. **Application → Cookies → pick your API host** (`*.koyeb.app`): you should see **`access_token`** / **`refresh_token`**, **HttpOnly**, **Secure**, **SameSite=None**.
+2. **Network → `GET /tasks/` (or any authed call) → Request headers**: there should be a **`Cookie:`** header on the request to the API. If it’s **missing**, the browser isn’t attaching cookies (SameSite / Secure / wrong API URL / third-party cookie rules).
+3. **Network → login response → Response headers**: **`Set-Cookie`** should list those cookies with **`SameSite=None`** and **`Secure`**.
+
+If cookies never stick or never send, a **same-origin proxy** (e.g. `https://nudgeweb.app/api/*` → Koyeb) avoids cross-site cookies entirely.
+
+### Mobile (Safari / Chrome) — 401 on `/api/suggestions` while desktop works
+
+Phones often enforce **stricter third-party / cross-site cookie rules** (e.g. Safari ITP). Your SPA may get **`Set-Cookie`** on login but **not** send **`Cookie`** on later `fetch` to the API host, so **`POST /api/suggestions`** returns **401**.
+
+**Preferred fix:** route API through the **same site** as the SPA (reverse proxy) so cookies are **first-party**.
+
+**Backend fallback:** set **`AUTH_RETURN_TOKENS_IN_BODY=true`** on the API. Then **`POST /auth/login`**, **`POST /auth/register`**, and **`POST /auth/refresh`** also return **`access_token`** and **`refresh_token`** in JSON (when enabled). The SPA should:
+
+1. Store tokens in **memory** or **sessionStorage** (not localStorage if you can avoid it).
+2. Send **`Authorization: Bearer <access_token>`** on API calls (middleware and `get_current_user` already accept Bearer).
+3. On **401**, call **`POST /auth/refresh`** with JSON body **`{ "refresh_token": "<stored refresh>" }`** if the refresh **cookie** is missing (this endpoint accepts **cookie or body**).
+
+**Security:** tokens in JS are **more exposed to XSS** than httpOnly cookies — use only if you need mobile web compatibility; tighten CSP and avoid inline scripts on the SPA.
 
 ---
 
@@ -51,9 +86,9 @@ The `Origin` header must match **exactly** (after we trim spaces and a trailing 
 
 ### Cold load
 
-1. **`POST /auth/refresh`** (no body). Send cookies (`credentials: 'include'`).
+1. **`POST /auth/refresh`** — with cookies (`credentials: 'include'`) **or**, on mobile, JSON body `{ "refresh_token": "..." }` if you use **`AUTH_RETURN_TOKENS_IN_BODY`** and stored refresh.
 2. **401** → treat as **logged out** (no valid refresh).
-3. **200** → new `Set-Cookie` for access + refresh; session restored.
+3. **200** → new `Set-Cookie` for access + refresh; if **`AUTH_RETURN_TOKENS_IN_BODY`**, update stored tokens from the JSON body.
 
 ### Login
 
@@ -123,6 +158,7 @@ Middleware + `Depends(get_current_user)` enforce auth on:
 | `AUTH_COOKIE_DOMAIN` | No | Optional e.g. `.example.com`. |
 | `AUTH_ACCESS_COOKIE_NAME` | No | Override access cookie name. |
 | `AUTH_REFRESH_COOKIE_NAME` | No | Override refresh cookie name. |
+| `AUTH_RETURN_TOKENS_IN_BODY` | No (`false`) | If `true`, login/register/refresh also return JWTs in JSON for **`Authorization: Bearer`** (mobile / cookie issues). |
 
 ---
 
