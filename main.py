@@ -1,4 +1,4 @@
-from typing import List, Annotated, Any, Optional
+from typing import List, Annotated, Any, Literal, Optional
 
 from sqlalchemy.orm import Session
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
@@ -22,6 +22,7 @@ from auth_middleware import TaskAuthMiddleware
 from auth_tokens import (
     attach_auth_cookies,
     auth_configured,
+    auth_return_tokens_in_body,
     clear_auth_cookies,
     create_access_token,
     create_refresh_token,
@@ -141,6 +142,33 @@ class UserPublic(BaseModel):
     email: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AuthSessionResponse(UserPublic):
+    """Same as UserPublic; optional token fields when AUTH_RETURN_TOKENS_IN_BODY is enabled."""
+
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[Literal["bearer"]] = None
+
+
+class RefreshOkResponse(BaseModel):
+    ok: bool = True
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[Literal["bearer"]] = None
+
+
+def _auth_session_response(person: models.Person, access: str, refresh: str) -> AuthSessionResponse:
+    base = UserPublic.model_validate(person).model_dump()
+    if auth_return_tokens_in_body():
+        return AuthSessionResponse(
+            **base,
+            access_token=access,
+            refresh_token=refresh,
+            token_type="bearer",
+        )
+    return AuthSessionResponse(**base)
 
 
 class AuthMeResponse(BaseModel):
@@ -539,7 +567,7 @@ async def health():
 # --- Auth (password + JWT in httpOnly cookies; Bearer header also supported) ---
 
 
-@app.post("/auth/register", response_model=UserPublic)
+@app.post("/auth/register", response_model=AuthSessionResponse, response_model_exclude_none=True)
 async def auth_register(body: RegisterRequest, db: db_dependency, response: Response):
     if not auth_configured():
         raise HTTPException(
@@ -558,15 +586,13 @@ async def auth_register(body: RegisterRequest, db: db_dependency, response: Resp
     db.add(person)
     db.commit()
     db.refresh(person)
-    attach_auth_cookies(
-        response,
-        create_access_token(person.user_id),
-        create_refresh_token(person.user_id),
-    )
-    return person
+    access = create_access_token(person.user_id)
+    refresh = create_refresh_token(person.user_id)
+    attach_auth_cookies(response, access, refresh)
+    return _auth_session_response(person, access, refresh)
 
 
-@app.post("/auth/login", response_model=UserPublic)
+@app.post("/auth/login", response_model=AuthSessionResponse, response_model_exclude_none=True)
 async def auth_login(body: LoginRequest, db: db_dependency, response: Response):
     if not auth_configured():
         raise HTTPException(
@@ -580,12 +606,10 @@ async def auth_login(body: LoginRequest, db: db_dependency, response: Response):
         user = db.query(models.Person).filter(models.Person.user_name == body.username).first()
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    attach_auth_cookies(
-        response,
-        create_access_token(user.user_id),
-        create_refresh_token(user.user_id),
-    )
-    return user
+    access = create_access_token(user.user_id)
+    refresh = create_refresh_token(user.user_id)
+    attach_auth_cookies(response, access, refresh)
+    return _auth_session_response(user, access, refresh)
 
 
 @app.post("/auth/logout")
@@ -609,11 +633,22 @@ async def auth_me(user: CurrentUser):
     )
 
 
-@app.post("/auth/refresh")
+@app.post("/auth/refresh", response_model=RefreshOkResponse, response_model_exclude_none=True)
 async def auth_refresh(request: Request, response: Response, db: db_dependency):
     if not auth_configured():
         raise HTTPException(status_code=503, detail="Authentication is not configured.")
-    rt = request.cookies.get(COOKIE_REFRESH_NAME)
+    rt: Optional[str] = request.cookies.get(COOKIE_REFRESH_NAME)
+    if not rt:
+        ct = request.headers.get("content-type") or ""
+        if "json" in ct.lower():
+            try:
+                body_json: Any = await request.json()
+            except Exception:
+                body_json = None
+            if isinstance(body_json, dict):
+                raw = body_json.get("refresh_token") or body_json.get("refreshToken")
+                if isinstance(raw, str):
+                    rt = raw.strip() or None
     if not rt:
         raise HTTPException(status_code=401, detail="Missing refresh token")
     try:
@@ -624,12 +659,17 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
     user = db.query(models.Person).filter(models.Person.user_id == uid).first()
     if user is None:
         raise HTTPException(status_code=401, detail="User no longer exists")
-    attach_auth_cookies(
-        response,
-        create_access_token(user.user_id),
-        create_refresh_token(user.user_id),
-    )
-    return {"ok": True}
+    new_access = create_access_token(user.user_id)
+    new_refresh = create_refresh_token(user.user_id)
+    attach_auth_cookies(response, new_access, new_refresh)
+    if auth_return_tokens_in_body():
+        return RefreshOkResponse(
+            ok=True,
+            access_token=new_access,
+            refresh_token=new_refresh,
+            token_type="bearer",
+        )
+    return RefreshOkResponse(ok=True)
 
 
 # --- Tasks (protected by TaskAuthMiddleware + Depends(get_current_user)) ---
