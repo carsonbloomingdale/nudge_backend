@@ -1,10 +1,47 @@
 import uuid
 
 from database import Base
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import mapped_column, relationship
 from sqlalchemy.sql import func
+
+
+class Journal(Base):
+    """User-facing log entry; embeds multiple Task rows for analytics / personality matrix."""
+
+    __tablename__ = "journals"
+
+    journal_id = mapped_column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("person.user_id"), nullable=False, index=True)
+    submitted_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    source = mapped_column(String(32), nullable=False, default="app")
+    note = mapped_column(Text, nullable=True)
+    tasks = relationship("Task", back_populates="journal", cascade="all, delete-orphan")
+    attachments = relationship(
+        "JournalAttachment",
+        back_populates="journal",
+        cascade="all, delete-orphan",
+    )
+
+
+class JournalAttachment(Base):
+    __tablename__ = "journal_attachments"
+
+    attachment_id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    journal_id = mapped_column(
+        Integer,
+        ForeignKey("journals.journal_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    storage_key = mapped_column(String(512), nullable=False)
+    content_type = mapped_column(String(128), nullable=False)
+    byte_size = mapped_column(Integer, nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    upload_completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+    journal = relationship("Journal", back_populates="attachments")
+
 
 class PersonalityTrait(Base):
     __tablename__ = 'personality_traits'
@@ -17,6 +54,12 @@ class Task(Base):
 
     task_id= mapped_column(Integer, primary_key=True, index=True)
     user_id= mapped_column(UUID, ForeignKey("person.user_id"))
+    journal_id = mapped_column(
+        Integer,
+        ForeignKey("journals.journal_id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     category=Column(String)
     label=Column(String)
     time_of_day=Column(String)
@@ -24,6 +67,7 @@ class Task(Base):
     day_of_week=Column(String)
     context= Column(String)
     sentiment=Column(String)
+    journal = relationship("Journal", back_populates="tasks")
     personality_traits = relationship(
         "PersonalityTrait",
         primaryjoin="and_(PersonalityTrait.task_id==Task.task_id)",

@@ -138,3 +138,39 @@ def ensure_person_profile_columns(engine) -> None:
     with engine.begin() as conn:
         for sql in stmts:
             conn.execute(text(sql))
+
+
+def ensure_journals_note_column(engine) -> None:
+    """Add journals.note if the table predates that column (create_all does not ALTER)."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    if not insp.has_table("journals"):
+        return
+    cols = {c["name"] for c in insp.get_columns("journals")}
+    if "note" in cols:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE journals ADD COLUMN note TEXT"))
+
+
+def ensure_journal_schema(engine) -> None:
+    """Add tasks.journal_id for DBs created before journals (create_all does not ALTER existing tables)."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    is_sqlite = engine.dialect.name == "sqlite"
+    if not insp.has_table("tasks"):
+        return
+    cols = {c["name"] for c in insp.get_columns("tasks")}
+    if "journal_id" in cols:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tasks ADD COLUMN journal_id INTEGER"))
+        if not is_sqlite and insp.has_table("journals"):
+            conn.execute(
+                text(
+                    "ALTER TABLE tasks ADD CONSTRAINT fk_tasks_journal_id "
+                    "FOREIGN KEY (journal_id) REFERENCES journals(journal_id) ON DELETE CASCADE"
+                )
+            )

@@ -1,14 +1,21 @@
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Annotated, Any, Literal, Optional
+from typing import List, Any, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from pydantic import BaseModel, Field, ConfigDict, computed_field, field_validator, model_validator
 from uuid import UUID
-from database import DbSession, engine, ensure_auth_columns, ensure_person_profile_columns
+from database import (
+    DbSession,
+    engine,
+    ensure_auth_columns,
+    ensure_journal_schema,
+    ensure_journals_note_column,
+    ensure_person_profile_columns,
+)
 from openai_client import OPENAI_MODEL, OPENAI_SUGGESTION_TEMPERATURE, openai_chat_completion
 import models
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +29,7 @@ import time
 from collections import defaultdict, deque
 from threading import Lock
 
+from auth_deps import CurrentUser
 from auth_middleware import TaskAuthMiddleware
 from auth_tokens import (
     attach_auth_cookies,
@@ -120,6 +128,7 @@ class TaskCreateBody(BaseModel):
 
 class TaskModel(TaskBase):
     task_id: int
+    journal_id: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -393,37 +402,8 @@ db_dependency = DbSession
 models.Base.metadata.create_all(bind=engine)
 ensure_auth_columns(engine)
 ensure_person_profile_columns(engine)
-
-
-def get_current_user(request: Request, db: db_dependency) -> models.Person:
-    if not auth_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="Authentication is not configured (set JWT_SECRET_KEY, min 32 chars).",
-        )
-    token = get_access_token_from_request(request)
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    try:
-        payload = decode_token(token, expected_type="access")
-        uid = UUID(payload["sub"])
-    except (JWTError, ValueError, KeyError):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    user = db.query(models.Person).filter(models.Person.user_id == uid).first()
-    if user is None:
-        raise HTTPException(status_code=401, detail="User no longer exists")
-    return user
-
-
-CurrentUser = Annotated[models.Person, Depends(get_current_user)]
+ensure_journal_schema(engine)
+ensure_journals_note_column(engine)
 
 
 def _auth_me_response(user: models.Person) -> AuthMeResponse:
@@ -836,13 +816,26 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
 
 @app.post("/tasks/", response_model=TaskModel)
 async def create_task(body: TaskCreateBody, db: db_dependency, user: CurrentUser):
+    from journal_service import insert_journal_with_tasks
+
     data = body.model_dump()
-    data["user_id"] = user.user_id
-    db_transaction = models.Task(**data)
-    db.add(db_transaction)
+    journal = insert_journal_with_tasks(
+        db,
+        user_id=user.user_id,
+        task_field_dicts=[data],
+        source="app",
+        note=None,
+    )
     db.commit()
-    db.refresh(db_transaction)
-    return db_transaction
+    task_row = (
+        db.query(models.Task)
+        .filter(models.Task.journal_id == journal.journal_id)
+        .order_by(models.Task.task_id.asc())
+        .first()
+    )
+    if task_row is None:
+        raise HTTPException(status_code=500, detail="Task row missing after journal create")
+    return TaskModel.model_validate(task_row)
 
 
 @app.get("/tasks", response_model=List[TaskModel])
@@ -929,8 +922,10 @@ async def user_by_user_name(username: str, db: db_dependency):
     return user
 
 
+from journal_api import router as journal_router
 from sms_checkin import sms_router
 
+app.include_router(journal_router)
 app.include_router(sms_router)
 
 
