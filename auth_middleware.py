@@ -55,7 +55,7 @@ class TaskAuthMiddleware(BaseHTTPMiddleware):
         debug_ctx = auth_request_debug_context(request)
         if not token:
             logger.info(
-                "Task auth 401 not_authenticated method=%s path=%s client=%s detail=%s",
+                "Task auth 401 not_authenticated reason=missing_token method=%s path=%s client=%s detail=%s",
                 request.method,
                 path,
                 client_host,
@@ -70,7 +70,7 @@ class TaskAuthMiddleware(BaseHTTPMiddleware):
             decode_token(token, expected_type="access")
         except JWTError as exc:
             logger.info(
-                "Task auth 401 invalid_token method=%s path=%s client=%s jwt_error=%s detail=%s",
+                "Task auth 401 invalid_token reason=invalid_or_expired_token method=%s path=%s client=%s jwt_error=%s detail=%s",
                 request.method,
                 path,
                 client_host,
