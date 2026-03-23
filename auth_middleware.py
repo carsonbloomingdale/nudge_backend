@@ -26,11 +26,16 @@ def _path_requires_task_auth(path: str) -> bool:
     p = path.split("?", 1)[0]
     if p in ("/tasks", "/tasks/"):
         return True
-    if p == "/api/tasks/enrich":
+    # DELETE /tasks/{id} (and other /tasks/<segment> except bare /tasks/)
+    if p.startswith("/tasks/") and len(p) > len("/tasks/"):
+        return True
+    if p.startswith("/api/tasks/"):
         return True
     if p == "/api/suggestions":
         return True
     if p.startswith("/api/journals"):
+        return True
+    if p.startswith("/api/analytics"):
         return True
     return False
 

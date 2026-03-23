@@ -140,6 +140,20 @@ def ensure_person_profile_columns(engine) -> None:
             conn.execute(text(sql))
 
 
+def ensure_person_enrichment_summary_column(engine) -> None:
+    """Add person.enrichment_summary for compact LLM context (replaces huge taskHistory in prompts)."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    if not insp.has_table("person"):
+        return
+    cols = {c["name"] for c in insp.get_columns("person")}
+    if "enrichment_summary" in cols:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE person ADD COLUMN enrichment_summary TEXT"))
+
+
 def ensure_journals_note_column(engine) -> None:
     """Add journals.note if the table predates that column (create_all does not ALTER)."""
     from sqlalchemy import inspect, text

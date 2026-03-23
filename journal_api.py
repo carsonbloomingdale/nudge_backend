@@ -15,6 +15,8 @@ import models
 from auth_deps import CurrentUser
 from database import DbSession
 from journal_service import delete_journal_attachments_from_storage, insert_journal_with_tasks
+from personality_analytics import invalidate_personality_chart_cache
+from task_schemas import PersonalityTraitItem
 
 router = APIRouter(prefix="/api/journals", tags=["journals"])
 
@@ -29,6 +31,21 @@ class JournalItemBody(BaseModel):
     time_of_day: str
     amount_of_time: str
     day_of_week: str
+    personality_traits: List[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("personality_traits", mode="before")
+    @classmethod
+    def _cap_journal_trait_strings(cls, v: object) -> object:
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return []
+        out: List[str] = []
+        for item in v[:5]:
+            s = str(item).strip()[:80]
+            if s:
+                out.append(s)
+        return out
 
 
 class JournalCreateBody(BaseModel):
@@ -61,6 +78,7 @@ class TaskLinePublic(BaseModel):
     time_of_day: str
     amount_of_time: str
     day_of_week: str
+    personality_traits: List[PersonalityTraitItem] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True, extra="ignore")
 
@@ -162,7 +180,10 @@ def _journal_to_public(j: models.Journal) -> JournalPublic:
 def _get_journal_for_user(db: Session, journal_id: int, user_id: UUID) -> models.Journal:
     row = (
         db.query(models.Journal)
-        .options(joinedload(models.Journal.tasks), joinedload(models.Journal.attachments))
+        .options(
+            joinedload(models.Journal.tasks).joinedload(models.Task.personality_traits),
+            joinedload(models.Journal.attachments),
+        )
         .filter(models.Journal.journal_id == journal_id, models.Journal.user_id == user_id)
         .first()
     )
@@ -184,6 +205,8 @@ def create_journal(body: JournalCreateBody, db: DbSession, user: CurrentUser):
     )
     db.commit()
     db.refresh(j)
+    invalidate_personality_chart_cache(db, user.user_id)
+    db.commit()
     j = _get_journal_for_user(db, j.journal_id, user.user_id)
     return _journal_to_public(j)
 
@@ -198,7 +221,10 @@ def list_journals(
 ):
     rows = (
         db.query(models.Journal)
-        .options(joinedload(models.Journal.tasks), joinedload(models.Journal.attachments))
+        .options(
+            joinedload(models.Journal.tasks).joinedload(models.Task.personality_traits),
+            joinedload(models.Journal.attachments),
+        )
         .filter(models.Journal.user_id == user.user_id)
         .order_by(models.Journal.submitted_at.desc(), models.Journal.journal_id.desc())
         .offset(skip)
@@ -224,6 +250,8 @@ def patch_journal(journal_id: int, body: JournalPatchBody, db: DbSession, user: 
     db.add(j)
     db.commit()
     db.refresh(j)
+    invalidate_personality_chart_cache(db, user.user_id)
+    db.commit()
     j = _get_journal_for_user(db, j.journal_id, user.user_id)
     return _journal_to_public(j)
 
@@ -240,6 +268,8 @@ def delete_journal(journal_id: int, db: DbSession, user: CurrentUser):
         raise HTTPException(status_code=404, detail="Journal not found")
     delete_journal_attachments_from_storage(db, j)
     db.delete(j)
+    db.commit()
+    invalidate_personality_chart_cache(db, user.user_id)
     db.commit()
     return Response(status_code=204)
 
