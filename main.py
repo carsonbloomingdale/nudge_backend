@@ -117,9 +117,11 @@ class TaskCreateBody(BaseModel):
     category: str
     label: str
     context: str
-    time_of_day: str
-    amount_of_time: str
-    day_of_week: str
+    # Keep these optional in request payloads for backward compatibility with
+    # older clients/tests that only send core task fields.
+    time_of_day: str = "unspecified"
+    amount_of_time: str = "unspecified"
+    day_of_week: str = "unspecified"
     personality_traits: List[str] = Field(default_factory=list, max_length=5)
 
     @field_validator("personality_traits", mode="before")
