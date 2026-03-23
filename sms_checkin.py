@@ -485,6 +485,10 @@ async def twilio_sms_webhook(request: Request, db: DbSession) -> Response:
     session_row.status = "completed"
     db.add(session_row)
     db.commit()
+    from personality_analytics import invalidate_personality_chart_cache
+
+    invalidate_personality_chart_cache(db, user.user_id)
+    db.commit()
 
     try:
         send_twilio_sms(from_num, CONFIRM_SAVED_TEXT)

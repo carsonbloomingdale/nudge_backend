@@ -1,7 +1,7 @@
 import uuid
 
 from database import Base
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import mapped_column, relationship
 from sqlalchemy.sql import func
@@ -23,6 +23,21 @@ class Journal(Base):
         back_populates="journal",
         cascade="all, delete-orphan",
     )
+
+
+class PersonalityChartCache(Base):
+    """Server-side cache for GET /api/analytics/personality-traits-chart (per user, raw vs AI)."""
+
+    __tablename__ = "personality_chart_cache"
+
+    user_id = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("person.user_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    payload_raw = mapped_column(JSON, nullable=True)
+    payload_ai = mapped_column(JSON, nullable=True)
+    updated_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
 class JournalAttachment(Base):
@@ -48,6 +63,21 @@ class PersonalityTrait(Base):
     task_id=mapped_column(Integer,  ForeignKey("tasks.task_id"))
     trait_id= Column(Integer, primary_key=True, index=True)
     label= Column(String)
+
+
+class PinnedPersonalityTrait(Base):
+    """User-selected traits to keep visible and feed into enrichment context."""
+
+    __tablename__ = "pinned_personality_traits"
+    __table_args__ = (
+        UniqueConstraint("user_id", "label", name="uq_pinned_personality_traits_user_label"),
+    )
+
+    pin_id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("person.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    label = mapped_column(String(80), nullable=False)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
 
 class Task(Base):
     __tablename__ = 'tasks'
@@ -86,6 +116,7 @@ class Person(Base):
     timezone = Column(String(64), nullable=True)
     sms_opt_in = Column(Boolean, nullable=False, default=False)
     phone_verified_at = Column(DateTime(timezone=True), nullable=True)
+    enrichment_summary = Column(Text, nullable=True)
     person_tasks = relationship(
         "Task",
         primaryjoin="and_(Task.user_id==Person.user_id)",

@@ -4,9 +4,9 @@ from datetime import datetime
 from typing import List, Any, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
-from pydantic import BaseModel, Field, ConfigDict, computed_field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, ConfigDict, computed_field, field_validator, model_validator
 from uuid import UUID
 from database import (
     DbSession,
@@ -14,10 +14,12 @@ from database import (
     ensure_auth_columns,
     ensure_journal_schema,
     ensure_journals_note_column,
+    ensure_person_enrichment_summary_column,
     ensure_person_profile_columns,
 )
 from openai_client import OPENAI_MODEL, OPENAI_SUGGESTION_TEMPERATURE, openai_chat_completion
 import models
+from task_schemas import PersonalityTraitItem
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError
 import asyncio
@@ -97,12 +99,6 @@ app.add_middleware(CORSMiddleware, **_cors_kwargs)
 app.add_middleware(TaskAuthMiddleware)
 
 
-class PersonalityTrait(BaseModel):
-    label: str
-    task_id: int
-    trait_id: int
-
-
 class TaskBase(BaseModel):
     sentiment: str
     category: str
@@ -124,11 +120,27 @@ class TaskCreateBody(BaseModel):
     time_of_day: str
     amount_of_time: str
     day_of_week: str
+    personality_traits: List[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("personality_traits", mode="before")
+    @classmethod
+    def _cap_trait_strings(cls, v: object) -> object:
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return []
+        out: List[str] = []
+        for item in v[:5]:
+            s = str(item).strip()[:80]
+            if s:
+                out.append(s)
+        return out
 
 
 class TaskModel(TaskBase):
     task_id: int
     journal_id: Optional[int] = None
+    personality_traits: List[PersonalityTraitItem] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -182,6 +194,7 @@ class AuthMeResponse(BaseModel):
     timezone: Optional[str] = None
     sms_opt_in: bool = False
     phone_verified_at: Optional[datetime] = None
+    enrichment_summary: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -362,13 +375,73 @@ class OpenAIRequestMeta(BaseModel):
     retries_used: int
 
 
+class EnrichmentSummaryRefreshResponse(BaseModel):
+    summary: str
+    meta: OpenAIRequestMeta
+
+
 class EnrichTaskRequest(BaseModel):
-    task: str = Field(min_length=1, max_length=300)
+    task: str = Field(
+        min_length=1,
+        max_length=300,
+        description="Short note to enrich. For long journal text use POST /api/tasks/split-from-journal first.",
+    )
     taskHistory: List[dict[str, Any]] = Field(default_factory=list, max_length=50)
+
+
+JOURNAL_SPLIT_MAX_CHARS = int(os.getenv("JOURNAL_SPLIT_MAX_CHARS", "12000"))
+ENRICH_BATCH_MAX_TASKS = int(os.getenv("ENRICH_BATCH_MAX_TASKS", "15"))
+ENRICH_SUMMARY_MAX_CHARS = int(os.getenv("ENRICH_SUMMARY_MAX_CHARS", "2000"))
+
+
+class JournalSplitRequest(BaseModel):
+    """Long journal / free-form entry; AI returns short lines suitable for enrich."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    journal_text: str = Field(
+        min_length=1,
+        max_length=JOURNAL_SPLIT_MAX_CHARS,
+        validation_alias=AliasChoices("journal_text", "journalText"),
+    )
+    taskHistory: List[dict[str, Any]] = Field(default_factory=list, max_length=50)
+
+
+class SplitTaskItem(BaseModel):
+    index: int
+    text: str
+    headline: str = ""
+
+
+class JournalSplitResponse(BaseModel):
+    items: List[SplitTaskItem]
+    meta: OpenAIRequestMeta
+
+
+class EnrichBatchRequest(BaseModel):
+    """Short task strings only (e.g. output of split-from-journal); max 300 chars each."""
+
+    tasks: List[str] = Field(min_length=1, max_length=ENRICH_BATCH_MAX_TASKS)
+    taskHistory: List[dict[str, Any]] = Field(default_factory=list, max_length=50)
+
+    @field_validator("tasks", mode="before")
+    @classmethod
+    def _validate_batch_tasks(cls, v: object) -> List[str]:
+        if not isinstance(v, list) or not v:
+            raise ValueError("tasks must be a non-empty list")
+        out: List[str] = []
+        for t in v[:ENRICH_BATCH_MAX_TASKS]:
+            s = str(t).strip()
+            if not s:
+                raise ValueError("Each task must be non-empty")
+            if len(s) > 300:
+                raise ValueError("Each task must be at most 300 characters (use split-from-journal first)")
+            out.append(s[:300])
+        return out
 
 
 class SuggestionRequest(BaseModel):
-    taskHistory: List[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    """No body required. Server derives context from user tasks/traits."""
 
 
 class EnrichedTask(BaseModel):
@@ -380,6 +453,11 @@ class EnrichedTask(BaseModel):
     amount_of_time: str
     day_of_week: str
     personality_traits: List[str] = Field(default_factory=list)
+
+
+class EnrichBatchResponse(BaseModel):
+    tasks: List[EnrichedTask]
+    meta: OpenAIRequestMeta
 
 
 class SuggestionPayload(BaseModel):
@@ -404,6 +482,7 @@ ensure_auth_columns(engine)
 ensure_person_profile_columns(engine)
 ensure_journal_schema(engine)
 ensure_journals_note_column(engine)
+ensure_person_enrichment_summary_column(engine)
 
 
 def _auth_me_response(user: models.Person) -> AuthMeResponse:
@@ -422,6 +501,7 @@ def _auth_me_response(user: models.Person) -> AuthMeResponse:
         timezone=user.timezone,
         sms_opt_in=bool(user.sms_opt_in),
         phone_verified_at=user.phone_verified_at,
+        enrichment_summary=user.enrichment_summary,
     )
 
 
@@ -442,20 +522,55 @@ _rate_limiter_lock = Lock()
 _rate_limiter_store: defaultdict[str, deque[float]] = defaultdict(deque)
 
 
-def _trim_task_history(task_history: List[dict[str, Any]]) -> List[dict[str, str]]:
+def _trim_task_history(
+    task_history: List[dict[str, Any]],
+    *,
+    max_items: int = 5,
+) -> List[dict[str, str]]:
+    """Small cap so client-sent taskHistory cannot blow up OpenAI prompts."""
     trimmed: List[dict[str, str]] = []
-    for item in task_history[-20:]:
+    n = max(1, min(max_items, 20))
+    for item in task_history[-n:]:
         if not isinstance(item, dict):
             continue
         trimmed.append(
             {
-                "label": str(item.get("label", ""))[:160],
-                "category": str(item.get("category", ""))[:80],
-                "sentiment": str(item.get("sentiment", ""))[:40],
-                "context": str(item.get("context", ""))[:220],
+                "label": str(item.get("label", ""))[:100],
+                "category": str(item.get("category", ""))[:50],
+                "sentiment": str(item.get("sentiment", ""))[:24],
+                "context": str(item.get("context", ""))[:140],
             }
         )
     return trimmed
+
+
+def _llm_user_background(
+    enrichment_summary: Optional[str],
+    task_history: List[dict[str, Any]],
+    pinned_traits: Optional[List[str]] = None,
+) -> dict[str, Any]:
+    """When a server-side summary exists, send it plus a tiny history tail; otherwise a slightly larger tail."""
+    cleaned_pinned = [str(x).strip()[:80] for x in (pinned_traits or []) if str(x).strip()][:20]
+    summary = (enrichment_summary or "").strip()
+    if summary:
+        hist = _trim_task_history(task_history, max_items=2)
+        out: dict[str, Any] = {
+            "user_profile_summary": summary[:ENRICH_SUMMARY_MAX_CHARS],
+        }
+        if cleaned_pinned:
+            out["pinned_traits"] = cleaned_pinned
+        if hist:
+            out["recent_task_history"] = hist
+        return out
+    hist = _trim_task_history(task_history, max_items=5)
+    out: dict[str, Any] = {}
+    if cleaned_pinned:
+        out["pinned_traits"] = cleaned_pinned
+    if hist:
+        out["recent_task_history"] = hist
+    if out:
+        return out
+    return {}
 
 
 def _enforce_rate_limit(client_key: str) -> None:
@@ -469,7 +584,59 @@ def _enforce_rate_limit(client_key: str) -> None:
         bucket.append(now)
 
 
-def _normalize_enriched_task(raw_payload: dict[str, Any], original_task: str) -> EnrichedTask:
+def _normalize_trait_label(raw: str) -> List[str]:
+    """Split combined trait strings and remove redundant 'trait' suffix."""
+    text = re.sub(r"\s+", " ", (raw or "").strip())
+    if not text:
+        return []
+    parts = re.split(r"\s*(?:,|/|&|\band\b|\bwith\b)\s*", text, flags=re.IGNORECASE)
+    out: List[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        cleaned = re.sub(r"\s+", " ", part).strip(" -_.,;:()[]{}")
+        cleaned = re.sub(r"\btraits?\b$", "", cleaned, flags=re.IGNORECASE).strip(" -_.,;:()[]{}")
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned[:80])
+    return out
+
+
+def _merge_required_pinned_traits(
+    inferred_traits: List[str],
+    pinned_traits: Optional[List[str]],
+) -> List[str]:
+    """Ensure every pinned trait appears in the output list at least once."""
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for trait in inferred_traits:
+        key = trait.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(trait)
+
+    for pinned in pinned_traits or []:
+        normalized_parts = _normalize_trait_label(str(pinned))
+        if not normalized_parts:
+            continue
+        pinned_label = normalized_parts[0]
+        key = pinned_label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(pinned_label)
+    return deduped
+
+
+def _normalize_enriched_task(
+    raw_payload: dict[str, Any],
+    original_task: str,
+    pinned_traits: Optional[List[str]] = None,
+) -> EnrichedTask:
     payload = raw_payload.get("task", raw_payload) if isinstance(raw_payload, dict) else {}
     if not isinstance(payload, dict):
         payload = {}
@@ -479,9 +646,10 @@ def _normalize_enriched_task(raw_payload: dict[str, Any], original_task: str) ->
     if isinstance(personality_traits, list):
         for trait in personality_traits:
             if isinstance(trait, str):
-                normalized_traits.append(trait[:80])
+                normalized_traits.extend(_normalize_trait_label(trait))
             elif isinstance(trait, dict) and trait.get("label"):
-                normalized_traits.append(str(trait.get("label"))[:80])
+                normalized_traits.extend(_normalize_trait_label(str(trait.get("label"))))
+    deduped_traits = _merge_required_pinned_traits(normalized_traits, pinned_traits)
 
     sentiment = str(payload.get("sentiment", "neutral")).lower().strip()
     if sentiment not in {"positive", "neutral", "negative"}:
@@ -500,7 +668,7 @@ def _normalize_enriched_task(raw_payload: dict[str, Any], original_task: str) ->
         or "unspecified",
         day_of_week=str(payload.get("day_of_week", payload.get("dayOfWeek", "unspecified"))).strip()[:40]
         or "unspecified",
-        personality_traits=normalized_traits[:5],
+        personality_traits=deduped_traits[:20],
     )
 
 
@@ -523,55 +691,292 @@ def _normalize_suggestion(raw_payload: dict[str, Any]) -> SuggestionPayload:
     )
 
 
-def _build_enrich_prompts(task: str, task_history: List[dict[str, Any]]) -> tuple[str, str]:
+def _build_enrich_prompts(
+    task: str,
+    task_history: List[dict[str, Any]],
+    enrichment_summary: Optional[str] = None,
+    pinned_traits: Optional[List[str]] = None,
+) -> tuple[str, str]:
     system_prompt = (
         "You extract task metadata from short user notes. Return strict JSON only with this exact shape: "
         '{"task":{"sentiment":"positive|neutral|negative","category":"string","label":"string","context":"string",'
-        '"time_of_day":"string","amount_of_time":"string","day_of_week":"string","personality_traits":["string"]}}.'
+        '"time_of_day":"string","amount_of_time":"string","day_of_week":"string","personality_traits":["string"]}}. '
+        "If user_profile_summary is present, use it for tone and recurring themes; recent_task_history is optional extra signal."
     )
     user_prompt = json.dumps(
         {
             "task": task,
-            "recent_task_history": _trim_task_history(task_history),
+            **_llm_user_background(enrichment_summary, task_history, pinned_traits),
             "rules": [
                 "Use short concise text.",
                 "If unknown, use 'unspecified'.",
                 "personality_traits should have up to 5 items.",
+                "Each personality_traits item must be a single trait only (no commas, '&', '/', or 'and').",
+                "Do not include the words 'trait' or 'traits' in personality_traits values.",
+                "If pinned_traits are present, personality_traits must include ALL pinned_traits values at least once.",
+                "When pinned_traits are present, additional non-pinned traits may also be generated.",
             ],
         }
     )
     return system_prompt, user_prompt
 
 
-def _build_suggestion_prompts(task_history: List[dict[str, Any]]) -> tuple[str, str]:
-    trimmed = _trim_task_history(task_history)
-    has_signal = any(
+def _build_journal_split_prompts(
+    journal_text: str,
+    task_history: List[dict[str, Any]],
+    enrichment_summary: Optional[str] = None,
+    pinned_traits: Optional[List[str]] = None,
+) -> tuple[str, str]:
+    system_prompt = (
+        "You read a long journal or reflective entry. Extract discrete task-sized items the user could log "
+        "in a productivity app (concrete actions, habits, or meaningful standalone beats). "
+        "Return strict JSON only with this exact shape: "
+        '{"items":[{"text":"string under 280 characters","headline":"optional very short title"}, ...]}. '
+        "Rules: (1) Each text is self-contained and at most 280 characters. "
+        "(2) Produce between 1 and 15 items depending on content; merge fluff; skip empty filler. "
+        "(3) Preserve distinct emotionally or practically important beats as separate items when appropriate. "
+        "(4) No markdown or unescaped newlines inside JSON string values. "
+        "If user_profile_summary is present, align tone with it when helpful."
+    )
+    user_prompt = json.dumps(
+        {
+            "journal_text": journal_text,
+            **_llm_user_background(enrichment_summary, task_history, pinned_traits),
+        }
+    )
+    return system_prompt, user_prompt
+
+
+def _normalize_journal_split(raw_payload: dict[str, Any]) -> List[SplitTaskItem]:
+    if not isinstance(raw_payload, dict):
+        return []
+    items = raw_payload.get("items")
+    if items is None:
+        items = raw_payload.get("tasks")
+    if not isinstance(items, list):
+        return []
+    out: List[SplitTaskItem] = []
+    for it in items[:20]:
+        headline = ""
+        if isinstance(it, str):
+            text = it.strip()
+        elif isinstance(it, dict):
+            text = str(it.get("text") or it.get("label") or "").strip()
+            headline = str(it.get("headline") or it.get("title") or "").strip()[:120]
+        else:
+            continue
+        if not text:
+            continue
+        text = text[:300]
+        out.append(SplitTaskItem(index=len(out), text=text, headline=headline))
+    return out
+
+
+def _build_batch_enrich_prompts(
+    tasks: List[str],
+    task_history: List[dict[str, Any]],
+    enrichment_summary: Optional[str] = None,
+    pinned_traits: Optional[List[str]] = None,
+) -> tuple[str, str]:
+    system_prompt = (
+        "You enrich multiple short user notes for a productivity app. "
+        "Return strict JSON only with this exact shape: "
+        '{"tasks":['
+        '{"sentiment":"positive|neutral|negative","category":"string","label":"string","context":"string",'
+        '"time_of_day":"string","amount_of_time":"string","day_of_week":"string","personality_traits":["string"]}'
+        "]}. "
+        "The tasks array must have the SAME LENGTH and SAME ORDER as the input tasks array. "
+        "Each object corresponds to the input string at the same index. "
+        "If user_profile_summary is present, use it for consistent tone and trait patterns; "
+        "recent_task_history is optional extra signal."
+    )
+    user_prompt = json.dumps(
+        {
+            "tasks": tasks,
+            **_llm_user_background(enrichment_summary, task_history, pinned_traits),
+            "rules": [
+                "Use short concise text per field.",
+                "If unknown, use 'unspecified'.",
+                "Up to 5 personality_traits per item.",
+                "Each personality_traits item must be a single trait only (no commas, '&', '/', or 'and').",
+                "Do not include the words 'trait' or 'traits' in personality_traits values.",
+                "If pinned_traits are present, each task's personality_traits must include ALL pinned_traits values at least once.",
+                "When pinned_traits are present, additional non-pinned traits may also be generated.",
+            ],
+        }
+    )
+    return system_prompt, user_prompt
+
+
+def _normalize_batch_enrich(
+    raw_payload: dict[str, Any],
+    originals: List[str],
+    pinned_traits: Optional[List[str]] = None,
+) -> List[EnrichedTask]:
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+    arr = raw_payload.get("tasks")
+    if not isinstance(arr, list):
+        arr = []
+    out: List[EnrichedTask] = []
+    for i, orig in enumerate(originals):
+        sub: dict[str, Any] = {}
+        if i < len(arr) and isinstance(arr[i], dict):
+            sub = {"task": arr[i]}
+        out.append(_normalize_enriched_task(sub, orig, pinned_traits))
+    return out
+
+
+def _build_suggestion_prompts(
+    task_history: List[dict[str, Any]],
+    enrichment_summary: Optional[str] = None,
+    pinned_traits: Optional[List[str]] = None,
+    smart_signals: Optional[dict[str, Any]] = None,
+) -> tuple[str, str]:
+    bg = _llm_user_background(enrichment_summary, task_history, pinned_traits)
+    trimmed = bg.get("recent_task_history") or []
+    has_signal = bool(bg.get("user_profile_summary")) or any(
         (row.get("label") or "").strip() or (row.get("context") or "").strip() for row in trimmed
     )
     system_prompt = (
         "You recommend one concrete next task for a productivity app. "
-        "Ground it in recent_task_history when possible. "
+        "Ground the suggestion in user_profile_summary and/or recent_task_history when present. "
         "Return strict JSON only with this exact shape: "
         '{"suggestion":{"reccomendedTask":"string","context":"string"}}.'
     )
     user_prompt = json.dumps(
         {
-            "recent_task_history": trimmed,
+            **bg,
+            "smart_signals": smart_signals or {},
             "history_has_specific_tasks": has_signal,
             "rules": [
                 "reccomendedTask: one short imperative line (about 12 words or fewer).",
-                "context: one sentence that ties the suggestion to patterns in recent_task_history.",
+                "context: one sentence that ties the suggestion to user_profile_summary and/or recent_task_history.",
                 "Prefer a logical follow-up, unblocker, or natural break given their categories and sentiments.",
-                "Do not assume facts not supported by recent_task_history (pets, children, commute, health) "
-                "unless labels or context clearly mention them.",
+                "Do not assume facts not supported by user_profile_summary or recent_task_history "
+                "(pets, children, commute, health) unless labels or context clearly mention them.",
                 "Avoid clichéd generic wellness filler (e.g. walk your dog, drink more water) unless history relates.",
                 "Do not merely repeat the latest task label; choose a distinct next step unless repeating is clearly useful.",
                 "If history_has_specific_tasks is false, suggest a neutral productive micro-task that needs no private details.",
                 "Avoid unsafe or medical/financial advice.",
+                "If pinned_traits are present, prefer suggestions that reinforce those focus traits when appropriate.",
+                "If smart_signals.low_traits includes candidates, prioritize a suggestion that exercises one of those lower-recent traits.",
+                "When smart_signals.actions_by_trait exists for a low trait, reuse those action patterns in the suggestion.",
             ],
         }
     )
     return system_prompt, user_prompt
+
+
+def _get_pinned_traits_for_user(db: Session, user_id: UUID) -> List[str]:
+    from personality_analytics import pinned_trait_labels_for_user
+
+    return pinned_trait_labels_for_user(db, user_id, limit=20)
+
+
+def _server_task_history_for_suggestions(db: Session, user_id: UUID, *, limit: int = 18) -> List[dict[str, Any]]:
+    rows = (
+        db.query(models.Task)
+        .filter(models.Task.user_id == user_id)
+        .order_by(models.Task.task_id.desc())
+        .limit(max(1, min(limit, 50)))
+        .all()
+    )
+    out: List[dict[str, Any]] = []
+    for t in rows:
+        out.append(
+            {
+                "label": str(t.label or "")[:120],
+                "category": str(t.category or "")[:60],
+                "sentiment": str(t.sentiment or "")[:24],
+                "context": str(t.context or "")[:180],
+            }
+        )
+    return out
+
+
+def _build_suggestion_smart_signals(db: Session, user_id: UUID) -> dict[str, Any]:
+    """Detect lower-recent traits and map them to historically related actions."""
+    rows = (
+        db.query(models.Task)
+        .options(joinedload(models.Task.personality_traits))
+        .filter(models.Task.user_id == user_id)
+        .order_by(models.Task.task_id.desc())
+        .limit(80)
+        .all()
+    )
+    if not rows:
+        return {}
+
+    recent_tasks = rows[:16]
+    baseline_tasks = rows[16:64]
+    if not baseline_tasks:
+        return {}
+
+    def _task_traits(task: models.Task) -> List[str]:
+        labels: List[str] = []
+        for tr in task.personality_traits or []:
+            for item in _normalize_trait_label(str(tr.label or "")):
+                if item:
+                    labels.append(item)
+        dedup: List[str] = []
+        seen: set[str] = set()
+        for label in labels:
+            key = label.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(label)
+        return dedup
+
+    recent_count: dict[str, int] = {}
+    baseline_count: dict[str, int] = {}
+    actions_by_trait: dict[str, List[dict[str, str]]] = {}
+    for task in baseline_tasks:
+        traits = _task_traits(task)
+        action = {
+            "label": str(task.label or "")[:120],
+            "category": str(task.category or "")[:60],
+            "context": str(task.context or "")[:140],
+        }
+        for trait in traits:
+            baseline_count[trait] = baseline_count.get(trait, 0) + 1
+            actions_by_trait.setdefault(trait, [])
+            if action not in actions_by_trait[trait]:
+                actions_by_trait[trait].append(action)
+    for task in recent_tasks:
+        for trait in _task_traits(task):
+            recent_count[trait] = recent_count.get(trait, 0) + 1
+
+    rn = max(len(recent_tasks), 1)
+    bn = max(len(baseline_tasks), 1)
+    low_traits: List[dict[str, Any]] = []
+    for trait, base_c in baseline_count.items():
+        if base_c < 2:
+            continue
+        rec_c = recent_count.get(trait, 0)
+        recent_ratio = (rec_c + 0.25) / (rn + 1.0)
+        baseline_ratio = (base_c + 0.25) / (bn + 1.0)
+        delta = recent_ratio - baseline_ratio
+        if delta < -0.02:
+            low_traits.append(
+                {
+                    "trait": trait,
+                    "recent_count": rec_c,
+                    "baseline_count": base_c,
+                    "delta_ratio": round(delta, 4),
+                }
+            )
+    low_traits.sort(key=lambda x: x["delta_ratio"])
+    if not low_traits:
+        return {}
+
+    chosen = low_traits[:3]
+    actions: dict[str, List[dict[str, str]]] = {}
+    for item in chosen:
+        trait = item["trait"]
+        actions[trait] = actions_by_trait.get(trait, [])[:3]
+    return {"low_traits": chosen, "actions_by_trait": actions}
 
 
 @app.get("/health")
@@ -642,6 +1047,73 @@ async def auth_logout(response: Response):
 async def auth_me(user: CurrentUser):
     """Current session profile (requires access cookie or Bearer)."""
     return _auth_me_response(user)
+
+
+@app.post("/auth/me/enrichment-summary/refresh", response_model=EnrichmentSummaryRefreshResponse)
+async def refresh_enrichment_summary_endpoint(
+    db: db_dependency,
+    user: CurrentUser,
+    request: Request,
+):
+    """One OpenAI call to build a short cached profile for enrich/split/suggestions (reduces huge taskHistory in prompts)."""
+    from personality_analytics import trait_snapshot_for_user
+
+    client_key = f"{request.client.host if request.client else 'unknown'}:/auth/me/enrichment-summary/refresh"
+    _enforce_rate_limit(client_key)
+
+    recent = (
+        db.query(models.Task)
+        .filter(models.Task.user_id == user.user_id)
+        .order_by(models.Task.task_id.desc())
+        .limit(15)
+        .all()
+    )
+    task_lines: List[dict[str, str]] = []
+    for t in recent:
+        task_lines.append(
+            {
+                "label": str(t.label or "")[:200],
+                "category": str(t.category or "")[:80],
+                "sentiment": str(t.sentiment or "")[:40],
+                "context": str(t.context or "")[:200],
+            }
+        )
+    traits = trait_snapshot_for_user(db, user.user_id, limit=15)
+    pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    name_hint = " ".join(
+        s for s in [(user.first_name or "").strip(), (user.last_name or "").strip()] if s
+    )
+    payload: dict[str, Any] = {
+        "recent_tasks_sample": task_lines,
+        "trait_and_category_counts": traits,
+        "pinned_traits": pinned_traits,
+    }
+    if name_hint:
+        payload["profile"] = {"display_name_hint": name_hint[:120]}
+
+    system_prompt = (
+        "You write a compact user profile for a productivity app's AI enrichment. "
+        'Return strict JSON only: {"summary":"string"}. '
+        f"The summary must be at most {ENRICH_SUMMARY_MAX_CHARS} characters. "
+        "Describe recurring themes, work style, emotional tone, and personality-relevant patterns "
+        "that would help label tasks consistently. "
+        "Do not invent private facts; only generalize from the data given. Plain text, no markdown."
+    )
+    user_prompt = json.dumps(payload)
+    raw_payload, retries_used = await openai_chat_completion(system_prompt, user_prompt, temperature=0.25)
+    summary = str(raw_payload.get("summary", "")).strip()[:ENRICH_SUMMARY_MAX_CHARS]
+    if not summary:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not build enrichment summary from your data. Add a few tasks and try again.",
+        )
+    user.enrichment_summary = summary
+    db.add(user)
+    db.commit()
+    return EnrichmentSummaryRefreshResponse(
+        summary=summary,
+        meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used),
+    )
 
 
 @app.post("/auth/me/phone/send-verification-code", response_model=AuthMeResponse)
@@ -816,9 +1288,10 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
 
 @app.post("/tasks/", response_model=TaskModel)
 async def create_task(body: TaskCreateBody, db: db_dependency, user: CurrentUser):
-    from journal_service import insert_journal_with_tasks
+    from journal_service import insert_journal_with_tasks, replace_personality_traits_for_task
 
     data = body.model_dump()
+    trait_labels = data.pop("personality_traits", []) or []
     journal = insert_journal_with_tasks(
         db,
         user_id=user.user_id,
@@ -826,11 +1299,25 @@ async def create_task(body: TaskCreateBody, db: db_dependency, user: CurrentUser
         source="app",
         note=None,
     )
-    db.commit()
+    db.flush()
     task_row = (
         db.query(models.Task)
         .filter(models.Task.journal_id == journal.journal_id)
         .order_by(models.Task.task_id.asc())
+        .first()
+    )
+    if task_row is None:
+        raise HTTPException(status_code=500, detail="Task row missing after journal create")
+    replace_personality_traits_for_task(db, task_row.task_id, trait_labels)
+    db.commit()
+    from personality_analytics import invalidate_personality_chart_cache
+
+    invalidate_personality_chart_cache(db, user.user_id)
+    db.commit()
+    task_row = (
+        db.query(models.Task)
+        .options(joinedload(models.Task.personality_traits))
+        .filter(models.Task.task_id == task_row.task_id)
         .first()
     )
     if task_row is None:
@@ -843,6 +1330,7 @@ async def create_task(body: TaskCreateBody, db: db_dependency, user: CurrentUser
 async def read_tasks(db: db_dependency, user: CurrentUser, skip: int = 0, limit: int = 100):
     tasks = (
         db.query(models.Task)
+        .options(joinedload(models.Task.personality_traits))
         .filter(models.Task.user_id == user.user_id)
         .offset(skip)
         .limit(limit)
@@ -851,25 +1339,98 @@ async def read_tasks(db: db_dependency, user: CurrentUser, skip: int = 0, limit:
     return tasks
 
 
+@app.delete("/tasks/{task_id}", status_code=204)
+@app.delete("/tasks/{task_id}/", status_code=204)
+async def delete_task(task_id: int, db: db_dependency, user: CurrentUser):
+    row = (
+        db.query(models.Task)
+        .filter(models.Task.task_id == task_id, models.Task.user_id == user.user_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    db.query(models.PersonalityTrait).filter(models.PersonalityTrait.task_id == task_id).delete()
+    db.delete(row)
+    db.commit()
+    from personality_analytics import invalidate_personality_chart_cache
+
+    invalidate_personality_chart_cache(db, user.user_id)
+    db.commit()
+    return Response(status_code=204)
+
+
 @app.post("/api/tasks/enrich", response_model=EnrichTaskResponse)
-async def enrich_task(body: EnrichTaskRequest, request: Request, user: CurrentUser):
-    _ = user
+async def enrich_task(body: EnrichTaskRequest, request: Request, user: CurrentUser, db: db_dependency):
     client_key = f"{request.client.host if request.client else 'unknown'}:/api/tasks/enrich"
     _enforce_rate_limit(client_key)
 
-    system_prompt, user_prompt = _build_enrich_prompts(body.task, body.taskHistory)
+    pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    system_prompt, user_prompt = _build_enrich_prompts(
+        body.task,
+        body.taskHistory,
+        user.enrichment_summary,
+        pinned_traits,
+    )
     raw_payload, retries_used = await openai_chat_completion(system_prompt, user_prompt)
-    normalized = _normalize_enriched_task(raw_payload, body.task)
+    normalized = _normalize_enriched_task(raw_payload, body.task, pinned_traits)
     return EnrichTaskResponse(task=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
 
 
+@app.post("/api/tasks/split-from-journal", response_model=JournalSplitResponse)
+async def split_tasks_from_journal(body: JournalSplitRequest, request: Request, user: CurrentUser, db: db_dependency):
+    """Step 1: long journal text → short task lines (then call /api/tasks/enrich or /api/tasks/enrich-batch)."""
+    client_key = f"{request.client.host if request.client else 'unknown'}:/api/tasks/split-from-journal"
+    _enforce_rate_limit(client_key)
+
+    pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    system_prompt, user_prompt = _build_journal_split_prompts(
+        body.journal_text, body.taskHistory, user.enrichment_summary, pinned_traits
+    )
+    raw_payload, retries_used = await openai_chat_completion(system_prompt, user_prompt, temperature=0.3)
+    items = _normalize_journal_split(raw_payload)
+    if not items:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract tasks from journal. Try again or shorten the entry.",
+        )
+    return JournalSplitResponse(items=items, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
+
+
+@app.post("/api/tasks/enrich-batch", response_model=EnrichBatchResponse)
+async def enrich_tasks_batch(body: EnrichBatchRequest, request: Request, user: CurrentUser, db: db_dependency):
+    """Step 2: enrich many short strings in one model call (output of split-from-journal)."""
+    client_key = f"{request.client.host if request.client else 'unknown'}:/api/tasks/enrich-batch"
+    _enforce_rate_limit(client_key)
+
+    pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    system_prompt, user_prompt = _build_batch_enrich_prompts(
+        body.tasks, body.taskHistory, user.enrichment_summary, pinned_traits
+    )
+    raw_payload, retries_used = await openai_chat_completion(system_prompt, user_prompt, temperature=0.2)
+    normalized = _normalize_batch_enrich(raw_payload, body.tasks, pinned_traits)
+    return EnrichBatchResponse(tasks=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
+
+
 @app.post("/api/suggestions", response_model=SuggestionResponse)
-async def create_suggestion(body: SuggestionRequest, request: Request, user: CurrentUser):
-    _ = user
+async def create_suggestion(
+    request: Request,
+    user: CurrentUser,
+    db: db_dependency,
+    body: Optional[SuggestionRequest] = None,
+):
+    _ = body  # Deprecated input; suggestions now use backend history/signals.
     client_key = f"{request.client.host if request.client else 'unknown'}:/api/suggestions"
     _enforce_rate_limit(client_key)
 
-    system_prompt, user_prompt = _build_suggestion_prompts(body.taskHistory)
+    pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    server_history = _server_task_history_for_suggestions(db, user.user_id, limit=18)
+    smart_signals = _build_suggestion_smart_signals(db, user.user_id)
+    system_prompt, user_prompt = _build_suggestion_prompts(
+        server_history,
+        user.enrichment_summary,
+        pinned_traits,
+        smart_signals,
+    )
     raw_payload, retries_used = await openai_chat_completion(
         system_prompt, user_prompt, temperature=OPENAI_SUGGESTION_TEMPERATURE
     )
@@ -923,9 +1484,11 @@ async def user_by_user_name(username: str, db: db_dependency):
 
 
 from journal_api import router as journal_router
+from personality_analytics import router as analytics_router
 from sms_checkin import sms_router
 
 app.include_router(journal_router)
+app.include_router(analytics_router)
 app.include_router(sms_router)
 
 

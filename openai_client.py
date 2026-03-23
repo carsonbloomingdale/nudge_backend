@@ -38,7 +38,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_SUGGESTION_TEMPERATURE = float(os.getenv("OPENAI_SUGGESTION_TEMPERATURE", "0.85"))
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "15"))
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
 OPENAI_RETRIES = int(os.getenv("OPENAI_RETRIES", "2"))
 
 
