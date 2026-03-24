@@ -154,6 +154,39 @@ def ensure_person_enrichment_summary_column(engine) -> None:
         conn.execute(text("ALTER TABLE person ADD COLUMN enrichment_summary TEXT"))
 
 
+def ensure_person_admin_columns(engine) -> None:
+    """Add role/account lock/admin note/mfa flags for admin console authz."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    if not insp.has_table("person"):
+        return
+    cols = {c["name"] for c in insp.get_columns("person")}
+    is_sqlite = engine.dialect.name == "sqlite"
+    stmts: list[str] = []
+    if "role" not in cols:
+        stmts.append("ALTER TABLE person ADD COLUMN role VARCHAR(32)")
+    if "account_locked" not in cols:
+        stmts.append(
+            "ALTER TABLE person ADD COLUMN account_locked "
+            + ("INTEGER NOT NULL DEFAULT 0" if is_sqlite else "BOOLEAN NOT NULL DEFAULT false")
+        )
+    if "admin_note" not in cols:
+        stmts.append("ALTER TABLE person ADD COLUMN admin_note TEXT")
+    if "mfa_enabled" not in cols:
+        stmts.append(
+            "ALTER TABLE person ADD COLUMN mfa_enabled "
+            + ("INTEGER NOT NULL DEFAULT 0" if is_sqlite else "BOOLEAN NOT NULL DEFAULT false")
+        )
+    if not stmts:
+        return
+    with engine.begin() as conn:
+        for sql in stmts:
+            conn.execute(text(sql))
+        # Backfill role for old rows.
+        conn.execute(text("UPDATE person SET role='user' WHERE role IS NULL OR role=''"))
+
+
 def ensure_journals_note_column(engine) -> None:
     """Add journals.note if the table predates that column (create_all does not ALTER)."""
     from sqlalchemy import inspect, text

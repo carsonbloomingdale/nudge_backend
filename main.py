@@ -15,6 +15,7 @@ from database import (
     ensure_journal_schema,
     ensure_journals_note_column,
     ensure_person_enrichment_summary_column,
+    ensure_person_admin_columns,
     ensure_person_profile_columns,
 )
 from openai_client import OPENAI_MODEL, OPENAI_SUGGESTION_TEMPERATURE, openai_chat_completion
@@ -197,6 +198,7 @@ class AuthMeResponse(BaseModel):
     sms_opt_in: bool = False
     phone_verified_at: Optional[datetime] = None
     enrichment_summary: Optional[str] = None
+    role: str = "user"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -349,6 +351,7 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
     email: Optional[str] = None
     username: Optional[str] = None
+    mfa_code: Optional[str] = Field(None, min_length=4, max_length=16)
 
     @model_validator(mode="after")
     def need_identifier(self) -> "LoginRequest":
@@ -485,6 +488,7 @@ ensure_person_profile_columns(engine)
 ensure_journal_schema(engine)
 ensure_journals_note_column(engine)
 ensure_person_enrichment_summary_column(engine)
+ensure_person_admin_columns(engine)
 
 
 def _auth_me_response(user: models.Person) -> AuthMeResponse:
@@ -504,6 +508,7 @@ def _auth_me_response(user: models.Person) -> AuthMeResponse:
         sms_opt_in=bool(user.sms_opt_in),
         phone_verified_at=user.phone_verified_at,
         enrichment_summary=user.enrichment_summary,
+        role=(user.role or "user"),
     )
 
 
@@ -550,9 +555,11 @@ def _llm_user_background(
     enrichment_summary: Optional[str],
     task_history: List[dict[str, Any]],
     pinned_traits: Optional[List[str]] = None,
+    pinned_goals: Optional[List[str]] = None,
 ) -> dict[str, Any]:
     """When a server-side summary exists, send it plus a tiny history tail; otherwise a slightly larger tail."""
     cleaned_pinned = [str(x).strip()[:80] for x in (pinned_traits or []) if str(x).strip()][:20]
+    cleaned_goals = [str(x).strip()[:160] for x in (pinned_goals or []) if str(x).strip()][:20]
     summary = (enrichment_summary or "").strip()
     if summary:
         hist = _trim_task_history(task_history, max_items=2)
@@ -561,6 +568,8 @@ def _llm_user_background(
         }
         if cleaned_pinned:
             out["pinned_traits"] = cleaned_pinned
+        if cleaned_goals:
+            out["pinned_goals"] = cleaned_goals
         if hist:
             out["recent_task_history"] = hist
         return out
@@ -568,6 +577,8 @@ def _llm_user_background(
     out: dict[str, Any] = {}
     if cleaned_pinned:
         out["pinned_traits"] = cleaned_pinned
+    if cleaned_goals:
+        out["pinned_goals"] = cleaned_goals
     if hist:
         out["recent_task_history"] = hist
     if out:
@@ -698,6 +709,7 @@ def _build_enrich_prompts(
     task_history: List[dict[str, Any]],
     enrichment_summary: Optional[str] = None,
     pinned_traits: Optional[List[str]] = None,
+    pinned_goals: Optional[List[str]] = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "You extract task metadata from short user notes. Return strict JSON only with this exact shape: "
@@ -708,7 +720,7 @@ def _build_enrich_prompts(
     user_prompt = json.dumps(
         {
             "task": task,
-            **_llm_user_background(enrichment_summary, task_history, pinned_traits),
+            **_llm_user_background(enrichment_summary, task_history, pinned_traits, pinned_goals),
             "rules": [
                 "Use short concise text.",
                 "If unknown, use 'unspecified'.",
@@ -717,6 +729,7 @@ def _build_enrich_prompts(
                 "Do not include the words 'trait' or 'traits' in personality_traits values.",
                 "If pinned_traits are present, personality_traits must include ALL pinned_traits values at least once.",
                 "When pinned_traits are present, additional non-pinned traits may also be generated.",
+                "If pinned_goals are present, align category/label/context toward those goals when reasonable.",
             ],
         }
     )
@@ -779,6 +792,7 @@ def _build_batch_enrich_prompts(
     task_history: List[dict[str, Any]],
     enrichment_summary: Optional[str] = None,
     pinned_traits: Optional[List[str]] = None,
+    pinned_goals: Optional[List[str]] = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "You enrich multiple short user notes for a productivity app. "
@@ -795,7 +809,7 @@ def _build_batch_enrich_prompts(
     user_prompt = json.dumps(
         {
             "tasks": tasks,
-            **_llm_user_background(enrichment_summary, task_history, pinned_traits),
+            **_llm_user_background(enrichment_summary, task_history, pinned_traits, pinned_goals),
             "rules": [
                 "Use short concise text per field.",
                 "If unknown, use 'unspecified'.",
@@ -804,6 +818,7 @@ def _build_batch_enrich_prompts(
                 "Do not include the words 'trait' or 'traits' in personality_traits values.",
                 "If pinned_traits are present, each task's personality_traits must include ALL pinned_traits values at least once.",
                 "When pinned_traits are present, additional non-pinned traits may also be generated.",
+                "If pinned_goals are present, align category/label/context toward those goals when reasonable.",
             ],
         }
     )
@@ -874,6 +889,18 @@ def _get_pinned_traits_for_user(db: Session, user_id: UUID) -> List[str]:
     from personality_analytics import pinned_trait_labels_for_user
 
     return pinned_trait_labels_for_user(db, user_id, limit=20)
+
+
+def _get_pinned_goals_for_user(db: Session, user_id: UUID) -> List[str]:
+    rows = (
+        db.query(models.GrowthGoal.label)
+        .join(models.PinnedGrowthGoal, models.PinnedGrowthGoal.goal_id == models.GrowthGoal.goal_id)
+        .filter(models.PinnedGrowthGoal.user_id == user_id)
+        .order_by(models.PinnedGrowthGoal.created_at.desc(), models.PinnedGrowthGoal.pin_id.desc())
+        .limit(20)
+        .all()
+    )
+    return [str(label or "").strip()[:160] for (label,) in rows if str(label or "").strip()]
 
 
 def _server_task_history_for_suggestions(db: Session, user_id: UUID, *, limit: int = 18) -> List[dict[str, Any]]:
@@ -1009,12 +1036,14 @@ async def auth_register(body: RegisterRequest, db: db_dependency, response: Resp
         phone_e164=body.phone_e164,
         timezone=body.timezone,
         sms_opt_in=body.sms_opt_in,
+        role="user",
     )
     db.add(person)
     db.commit()
     db.refresh(person)
-    access = create_access_token(person.user_id)
-    refresh = create_refresh_token(person.user_id)
+    is_admin = (person.role or "").lower() in {"admin", "support_agent"}
+    access = create_access_token(person.user_id, is_admin=is_admin)
+    refresh = create_refresh_token(person.user_id, is_admin=is_admin)
     attach_auth_cookies(response, access, refresh)
     return _auth_session_response(person, access, refresh)
 
@@ -1033,8 +1062,16 @@ async def auth_login(body: LoginRequest, db: db_dependency, response: Response):
         user = db.query(models.Person).filter(models.Person.user_name == body.username).first()
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    access = create_access_token(user.user_id)
-    refresh = create_refresh_token(user.user_id)
+    if bool(user.account_locked):
+        raise HTTPException(status_code=403, detail="Account is locked")
+    is_admin = (user.role or "").lower() in {"admin", "support_agent"}
+    if is_admin and bool(user.mfa_enabled):
+        expected = (os.getenv("ADMIN_MFA_BYPASS_CODE") or "").strip()
+        supplied = (body.model_dump().get("mfa_code") or "")
+        if expected and supplied != expected:
+            raise HTTPException(status_code=403, detail="Admin MFA check failed")
+    access = create_access_token(user.user_id, is_admin=is_admin)
+    refresh = create_refresh_token(user.user_id, is_admin=is_admin)
     attach_auth_cookies(response, access, refresh)
     return _auth_session_response(user, access, refresh)
 
@@ -1273,8 +1310,14 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
     user = db.query(models.Person).filter(models.Person.user_id == uid).first()
     if user is None:
         raise HTTPException(status_code=401, detail="User no longer exists")
-    new_access = create_access_token(user.user_id)
-    new_refresh = create_refresh_token(user.user_id)
+    if bool(user.account_locked):
+        raise HTTPException(status_code=403, detail="Account is locked")
+    is_admin = (user.role or "").lower() in {"admin", "support_agent"}
+    # Stricter admin refresh: must come from secure cookie path (not JSON body token).
+    if is_admin and not request.cookies.get(COOKIE_REFRESH_NAME):
+        raise HTTPException(status_code=401, detail="Admin refresh requires cookie session")
+    new_access = create_access_token(user.user_id, is_admin=is_admin)
+    new_refresh = create_refresh_token(user.user_id, is_admin=is_admin)
     attach_auth_cookies(response, new_access, new_refresh)
     return RefreshOkResponse(
         ok=True,
@@ -1290,10 +1333,16 @@ async def auth_refresh(request: Request, response: Response, db: db_dependency):
 
 @app.post("/tasks/", response_model=TaskModel)
 async def create_task(body: TaskCreateBody, db: db_dependency, user: CurrentUser):
+    from growth_analytics import refresh_user_goal_trait_rollups
     from journal_service import insert_journal_with_tasks, replace_personality_traits_for_task
 
     data = body.model_dump()
     trait_labels = data.pop("personality_traits", []) or []
+    normalized_traits: List[str] = []
+    for raw in trait_labels:
+        normalized_traits.extend(_normalize_trait_label(str(raw)))
+    pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    trait_labels = _merge_required_pinned_traits(normalized_traits, pinned_traits)
     journal = insert_journal_with_tasks(
         db,
         user_id=user.user_id,
@@ -1315,6 +1364,7 @@ async def create_task(body: TaskCreateBody, db: db_dependency, user: CurrentUser
     from personality_analytics import invalidate_personality_chart_cache
 
     invalidate_personality_chart_cache(db, user.user_id)
+    refresh_user_goal_trait_rollups(db, user.user_id)
     db.commit()
     task_row = (
         db.query(models.Task)
@@ -1344,6 +1394,8 @@ async def read_tasks(db: db_dependency, user: CurrentUser, skip: int = 0, limit:
 @app.delete("/tasks/{task_id}", status_code=204)
 @app.delete("/tasks/{task_id}/", status_code=204)
 async def delete_task(task_id: int, db: db_dependency, user: CurrentUser):
+    from growth_analytics import refresh_user_goal_trait_rollups
+
     row = (
         db.query(models.Task)
         .filter(models.Task.task_id == task_id, models.Task.user_id == user.user_id)
@@ -1357,6 +1409,7 @@ async def delete_task(task_id: int, db: db_dependency, user: CurrentUser):
     from personality_analytics import invalidate_personality_chart_cache
 
     invalidate_personality_chart_cache(db, user.user_id)
+    refresh_user_goal_trait_rollups(db, user.user_id)
     db.commit()
     return Response(status_code=204)
 
@@ -1367,11 +1420,13 @@ async def enrich_task(body: EnrichTaskRequest, request: Request, user: CurrentUs
     _enforce_rate_limit(client_key)
 
     pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    pinned_goals = _get_pinned_goals_for_user(db, user.user_id)
     system_prompt, user_prompt = _build_enrich_prompts(
         body.task,
         body.taskHistory,
         user.enrichment_summary,
         pinned_traits,
+        pinned_goals,
     )
     raw_payload, retries_used = await openai_chat_completion(system_prompt, user_prompt)
     normalized = _normalize_enriched_task(raw_payload, body.task, pinned_traits)
@@ -1405,8 +1460,9 @@ async def enrich_tasks_batch(body: EnrichBatchRequest, request: Request, user: C
     _enforce_rate_limit(client_key)
 
     pinned_traits = _get_pinned_traits_for_user(db, user.user_id)
+    pinned_goals = _get_pinned_goals_for_user(db, user.user_id)
     system_prompt, user_prompt = _build_batch_enrich_prompts(
-        body.tasks, body.taskHistory, user.enrichment_summary, pinned_traits
+        body.tasks, body.taskHistory, user.enrichment_summary, pinned_traits, pinned_goals
     )
     raw_payload, retries_used = await openai_chat_completion(system_prompt, user_prompt, temperature=0.2)
     normalized = _normalize_batch_enrich(raw_payload, body.tasks, pinned_traits)
@@ -1486,10 +1542,14 @@ async def user_by_user_name(username: str, db: db_dependency):
 
 
 from journal_api import router as journal_router
+from growth_analytics import router as growth_router
+from admin_support_api import router as admin_support_router
 from personality_analytics import router as analytics_router
 from sms_checkin import sms_router
 
 app.include_router(journal_router)
+app.include_router(growth_router)
+app.include_router(admin_support_router)
 app.include_router(analytics_router)
 app.include_router(sms_router)
 

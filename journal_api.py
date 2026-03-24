@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
@@ -15,10 +16,55 @@ import models
 from auth_deps import CurrentUser
 from database import DbSession
 from journal_service import delete_journal_attachments_from_storage, insert_journal_with_tasks
-from personality_analytics import invalidate_personality_chart_cache
+from growth_analytics import refresh_user_goal_trait_rollups
+from personality_analytics import invalidate_personality_chart_cache, pinned_trait_labels_for_user
 from task_schemas import PersonalityTraitItem
 
 router = APIRouter(prefix="/api/journals", tags=["journals"])
+
+
+def _split_and_normalize_traits(raw: str) -> List[str]:
+    s = " ".join((raw or "").strip().split())
+    if not s:
+        return []
+    parts = re.split(r"\s*(?:,|/|&|\band\b|\bwith\b)\s*", s, flags=re.IGNORECASE)
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        cleaned = re.sub(r"\btraits?\b$", "", p.strip(), flags=re.IGNORECASE).strip(" -_.,;:()[]{}")
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned[:80])
+    return out
+
+
+def _merge_with_pinned_traits(raw_traits: List[str], pinned_traits: List[str]) -> List[str]:
+    inferred: List[str] = []
+    for t in raw_traits:
+        inferred.extend(_split_and_normalize_traits(str(t)))
+    out: List[str] = []
+    seen: set[str] = set()
+    for t in inferred:
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    for p in pinned_traits:
+        vals = _split_and_normalize_traits(str(p))
+        if not vals:
+            continue
+        t = vals[0]
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out
 
 
 class JournalItemBody(BaseModel):
@@ -195,7 +241,12 @@ def _get_journal_for_user(db: Session, journal_id: int, user_id: UUID) -> models
 @router.post("", response_model=JournalPublic)
 @router.post("/", response_model=JournalPublic)
 def create_journal(body: JournalCreateBody, db: DbSession, user: CurrentUser):
-    items = [it.model_dump() for it in body.items]
+    pinned_traits = pinned_trait_labels_for_user(db, user.user_id, limit=20)
+    items = []
+    for it in body.items:
+        data = it.model_dump()
+        data["personality_traits"] = _merge_with_pinned_traits(data.get("personality_traits", []) or [], pinned_traits)
+        items.append(data)
     j = insert_journal_with_tasks(
         db,
         user_id=user.user_id,
@@ -206,6 +257,7 @@ def create_journal(body: JournalCreateBody, db: DbSession, user: CurrentUser):
     db.commit()
     db.refresh(j)
     invalidate_personality_chart_cache(db, user.user_id)
+    refresh_user_goal_trait_rollups(db, user.user_id)
     db.commit()
     j = _get_journal_for_user(db, j.journal_id, user.user_id)
     return _journal_to_public(j)
@@ -270,6 +322,7 @@ def delete_journal(journal_id: int, db: DbSession, user: CurrentUser):
     db.delete(j)
     db.commit()
     invalidate_personality_chart_cache(db, user.user_id)
+    refresh_user_goal_trait_rollups(db, user.user_id)
     db.commit()
     return Response(status_code=204)
 

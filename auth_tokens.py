@@ -44,6 +44,14 @@ def _refresh_expire_days() -> int:
     return int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "7"))
 
 
+def _admin_access_expire_minutes() -> int:
+    return int(os.getenv("JWT_ADMIN_ACCESS_EXPIRE_MINUTES", "5"))
+
+
+def _admin_refresh_expire_days() -> int:
+    return int(os.getenv("JWT_ADMIN_REFRESH_EXPIRE_DAYS", "1"))
+
+
 COOKIE_ACCESS_NAME = os.getenv("AUTH_ACCESS_COOKIE_NAME", "access_token")
 COOKIE_REFRESH_NAME = os.getenv("AUTH_REFRESH_COOKIE_NAME", "refresh_token")
 
@@ -71,11 +79,11 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_access_token(subject_user_id: UUID) -> str:
+def create_access_token(subject_user_id: UUID, *, is_admin: bool = False) -> str:
     if not auth_configured():
         raise RuntimeError("JWT_SECRET_KEY must be set (min 32 chars)")
     secret = _jwt_secret()
-    expire = _now() + timedelta(minutes=_access_expire_minutes())
+    expire = _now() + timedelta(minutes=_admin_access_expire_minutes() if is_admin else _access_expire_minutes())
     payload: dict[str, Any] = {
         "sub": str(subject_user_id),
         "typ": "access",
@@ -85,11 +93,11 @@ def create_access_token(subject_user_id: UUID) -> str:
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
-def create_refresh_token(subject_user_id: UUID) -> str:
+def create_refresh_token(subject_user_id: UUID, *, is_admin: bool = False) -> str:
     if not auth_configured():
         raise RuntimeError("JWT_SECRET_KEY must be set (min 32 chars)")
     secret = _jwt_secret()
-    expire = _now() + timedelta(days=_refresh_expire_days())
+    expire = _now() + timedelta(days=_admin_refresh_expire_days() if is_admin else _refresh_expire_days())
     payload: dict[str, Any] = {
         "sub": str(subject_user_id),
         "typ": "refresh",

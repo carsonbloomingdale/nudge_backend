@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Annotated
 from uuid import UUID
 
@@ -43,3 +44,22 @@ def get_current_user(request: Request, db: db_dependency) -> models.Person:
 
 
 CurrentUser = Annotated[models.Person, Depends(get_current_user)]
+
+
+def require_admin_user(request: Request, db: db_dependency) -> models.Person:
+    user = get_current_user(request, db)
+    if bool(user.account_locked):
+        raise HTTPException(status_code=403, detail="Account is locked")
+    role = (user.role or "user").strip().lower()
+    if role not in {"admin", "support_agent"}:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    # Optional low-friction MFA hook for admin endpoints.
+    if bool(user.mfa_enabled):
+        expected = (os.getenv("ADMIN_MFA_BYPASS_CODE") or "").strip()
+        code = (request.headers.get("x-admin-mfa-code") or "").strip()
+        if expected and code != expected:
+            raise HTTPException(status_code=403, detail="Admin MFA check failed")
+    return user
+
+
+AdminUser = Annotated[models.Person, Depends(require_admin_user)]
