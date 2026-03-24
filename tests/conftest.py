@@ -19,6 +19,7 @@ os.environ.setdefault("SMS_DRY_RUN", "true")
 import pytest
 
 import main  # noqa: E402  — after env
+from database import SessionLocal
 
 
 @pytest.fixture
@@ -56,3 +57,20 @@ def register_user(client):
         return data["access_token"], username, email
 
     return _register
+
+
+@pytest.fixture(autouse=True)
+def _isolate_db_state_per_test():
+    """
+    Keep tests independent when using a shared in-memory SQLite engine.
+    Some tests insert fixed PK values (e.g. personality_traits.trait_id), so
+    rows from prior tests must be cleared to avoid uniqueness collisions.
+    """
+    db = SessionLocal()
+    try:
+        for table in reversed(main.models.Base.metadata.sorted_tables):
+            db.execute(table.delete())
+        db.commit()
+    finally:
+        db.close()
+    yield
