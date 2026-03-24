@@ -117,6 +117,8 @@ class Task(Base):
     goal_links = relationship(
         "TaskGrowthGoalLink",
         primaryjoin="and_(TaskGrowthGoalLink.task_id==Task.task_id)",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
