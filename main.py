@@ -22,6 +22,7 @@ from openai_client import OPENAI_MODEL, OPENAI_SUGGESTION_TEMPERATURE, openai_ch
 import models
 from task_schemas import PersonalityTraitItem
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from jose import JWTError
 import asyncio
 import json
@@ -48,6 +49,26 @@ from auth_tokens import (
 )
 
 logger = logging.getLogger(__name__)
+# Uvicorn’s default log config shows `uvicorn.error` / access; app `main` INFO often does not.
+_request_origin_log = logging.getLogger("uvicorn.error")
+
+
+class LogRequestOriginMiddleware(BaseHTTPMiddleware):
+    """Log `Origin` (via uvicorn’s logger) so you can paste it into `CORS_ORIGINS`.
+
+    Starlette returns 400 on OPTIONS preflight when Origin is not allowed — that is usually
+    why you see `OPTIONS ... 400` with no other app logs.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+        _request_origin_log.info(
+            "Request Origin: %s | %s %s",
+            origin if origin else "(no Origin header)",
+            request.method,
+            request.url.path,
+        )
+        return await call_next(request)
 
 
 def _parse_cors_config() -> tuple[list[str], Optional[str], bool]:
@@ -98,6 +119,7 @@ _cors_kwargs["allow_origins"] = _cors_origins if _cors_origins else []
 
 app.add_middleware(CORSMiddleware, **_cors_kwargs)
 app.add_middleware(TaskAuthMiddleware)
+app.add_middleware(LogRequestOriginMiddleware)
 
 
 class TaskBase(BaseModel):
