@@ -167,6 +167,66 @@ def _clean_segment_label(label: str) -> str:
     return (s or "Unknown")[:120]
 
 
+_TRAIT_QUALIFIER_TOKENS = {
+    "focused",
+    "focus",
+    "focusing",
+    "oriented",
+    "orientation",
+    "minded",
+    "mindset",
+    "centric",
+    "centered",
+    "based",
+    "driven",
+    "intentional",
+}
+
+
+def _trait_key(label: str) -> str:
+    s = _clean_segment_label(label).lower()
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def _trait_core_key(label: str) -> str:
+    tokens = [t for t in re.findall(r"[a-z0-9]+", _clean_segment_label(label).lower()) if t]
+    core = [t for t in tokens if t not in _TRAIT_QUALIFIER_TOKENS]
+    return " ".join(core if core else tokens).strip()
+
+
+def _canonicalize_raw_aggregates_with_pinned(raw: List[RawTraitAggregate], pinned_traits: List[str]) -> tuple[List[RawTraitAggregate], int]:
+    if not raw or not pinned_traits:
+        return raw, 0
+
+    pinned_by_exact: dict[str, str] = {}
+    pinned_by_core: dict[str, str] = {}
+    for pin in pinned_traits:
+        p = str(pin or "").strip()
+        if not p:
+            continue
+        exact = _trait_key(p)
+        core = _trait_core_key(p)
+        if exact:
+            pinned_by_exact.setdefault(exact, p)
+        if core:
+            pinned_by_core.setdefault(core, p)
+
+    merged_counts: dict[str, int] = {}
+    rewrites = 0
+    for row in raw:
+        src = row.label.strip()
+        canonical = pinned_by_exact.get(_trait_key(src))
+        if canonical is None:
+            canonical = pinned_by_core.get(_trait_core_key(src), src)
+        if canonical != src:
+            rewrites += 1
+        merged_counts[canonical] = merged_counts.get(canonical, 0) + row.count
+
+    out = [RawTraitAggregate(label=label, count=cnt) for label, cnt in merged_counts.items()]
+    out.sort(key=lambda x: (-x.count, x.label.lower()))
+    return out, rewrites
+
+
 def _build_ai_prompt(traits_payload: list[dict[str, Any]]) -> tuple[str, str]:
     system = (
         "You group free-form personality trait labels for a chart. Return strict JSON only. "
@@ -294,6 +354,11 @@ async def compute_personality_traits_chart(
             "Counts are grouped by task.category because there are no rows in personality_traits yet. "
             "Send personality_traits on POST /tasks/ or journal items to populate trait-level data."
         )
+    else:
+        pinned_traits = pinned_trait_labels_for_user(db, user_id, limit=50)
+        raw, rewritten = _canonicalize_raw_aggregates_with_pinned(raw, pinned_traits)
+        if rewritten:
+            base_meta["pinned_canonicalization_applied"] = rewritten
 
     traits_payload = [{"label": r.label, "count": r.count} for r in raw]
 
