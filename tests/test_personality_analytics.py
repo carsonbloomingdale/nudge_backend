@@ -148,3 +148,40 @@ def test_personality_chart_raw_aggregates(client, register_user):
     assert {x["label"]: x["count"] for x in data["raw_aggregates"]} == {"Planner": 2, "Creative": 1}
     assert len(data["segments"]) == 2
     assert data["chart_mode"] == "raw_only"
+
+
+def test_personality_chart_prefers_pinned_canonical_trait_label(client, register_user):
+    token, _, _ = register_user(suffix="ptpin")
+    me = client.get("/auth/me", headers=_bearer(token))
+    uid = UUID(me.json()["user_id"])
+
+    db = SessionLocal()
+    try:
+        db.add(models.PinnedPersonalityTrait(user_id=uid, label="Wellness Focused"))
+        t = models.Task(
+            user_id=uid,
+            journal_id=None,
+            sentiment="neutral",
+            category="health",
+            label="task1",
+            context="",
+            time_of_day="morning",
+            amount_of_time="5m",
+            day_of_week="Mon",
+        )
+        db.add(t)
+        db.flush()
+        db.add(models.PersonalityTrait(task_id=t.task_id, trait_id=101, label="Wellness Oriented"))
+        db.add(models.PersonalityTrait(task_id=t.task_id, trait_id=102, label="Wellness Focused"))
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.get(
+        "/api/analytics/personality-traits-chart?use_ai=false",
+        headers=_bearer(token),
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert {x["label"]: x["count"] for x in data["raw_aggregates"]} == {"Wellness Focused": 2}
+    assert data["meta"].get("pinned_canonicalization_applied") == 1
