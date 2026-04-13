@@ -118,7 +118,19 @@ def decode_token(token: str, *, expected_type: str) -> dict[str, Any]:
 
 
 # Browser cookies (httpOnly). For cross-site SPAs use COOKIE_SAMESITE=none + COOKIE_SECURE=true.
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
+def _cookie_secure_from_env() -> bool:
+    raw = (os.getenv("COOKIE_SECURE") or "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    env = (os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or "").strip().lower()
+    if env in ("production", "prod", "staging"):
+        return True
+    return False
+
+
+COOKIE_SECURE = _cookie_secure_from_env()
 _raw_samesite = (os.getenv("COOKIE_SAMESITE", "lax") or "lax").lower()
 if _raw_samesite not in ("lax", "strict", "none"):
     _raw_samesite = "lax"

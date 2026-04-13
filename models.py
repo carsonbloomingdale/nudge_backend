@@ -310,3 +310,53 @@ class SupportTicketEvent(Base):
     new_value = mapped_column(String(120), nullable=True)
     created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
     ticket = relationship("SupportTicket", back_populates="events")
+
+
+class FinanceTransaction(Base):
+    __tablename__ = "finance_transactions"
+
+    transaction_id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("person.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    occurred_on = mapped_column(Date, nullable=False, index=True)
+    amount_minor = mapped_column(Integer, nullable=False)  # signed; cents
+    currency = mapped_column(String(12), nullable=False, default="USD")
+    merchant_raw = mapped_column(String(200), nullable=False, default="")
+    merchant_normalized = mapped_column(String(200), nullable=False, default="", index=True)
+    description = mapped_column(String(300), nullable=False, default="")
+    category = mapped_column(String(80), nullable=True, index=True)
+    source = mapped_column(String(32), nullable=False, default="manual", index=True)
+    source_external_id = mapped_column(String(128), nullable=True, index=True)
+    account_label = mapped_column(String(120), nullable=True)
+    is_hidden_from_charts = mapped_column(Boolean, nullable=False, default=False)
+    deleted_at = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class FinanceCategorizationJob(Base):
+    __tablename__ = "finance_categorization_jobs"
+
+    job_id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("person.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    status = mapped_column(String(24), nullable=False, default="queued", index=True)  # queued|running|completed|partial|failed
+    requested_count = mapped_column(Integer, nullable=False, default=0)
+    processed_count = mapped_column(Integer, nullable=False, default=0)
+    failed_count = mapped_column(Integer, nullable=False, default=0)
+    transaction_ids = mapped_column(JSON, nullable=True)
+    error_detail = mapped_column(String(300), nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FinanceBudget(Base):
+    __tablename__ = "finance_budgets"
+
+    budget_id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("person.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    category = mapped_column(String(80), nullable=False, index=True)
+    period = mapped_column(String(16), nullable=False, default="monthly", index=True)  # monthly|weekly|custom
+    period_start = mapped_column(Date, nullable=False, index=True)
+    period_end = mapped_column(Date, nullable=False, index=True)
+    amount_minor = mapped_column(Integer, nullable=False)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
