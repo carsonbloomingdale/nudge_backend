@@ -53,11 +53,15 @@ def require_admin_user(request: Request, db: db_dependency) -> models.Person:
     role = (user.role or "user").strip().lower()
     if role not in {"admin", "support_agent"}:
         raise HTTPException(status_code=403, detail="Admin access required")
-    # Optional low-friction MFA hook for admin endpoints.
     if bool(user.mfa_enabled):
         expected = (os.getenv("ADMIN_MFA_BYPASS_CODE") or "").strip()
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail="Admin MFA is enabled but ADMIN_MFA_BYPASS_CODE is not set on the server.",
+            )
         code = (request.headers.get("x-admin-mfa-code") or "").strip()
-        if expected and code != expected:
+        if code != expected:
             raise HTTPException(status_code=403, detail="Admin MFA check failed")
     return user
 

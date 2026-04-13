@@ -12,6 +12,7 @@ from database import (
     DbSession,
     engine,
     ensure_auth_columns,
+    ensure_finance_schema,
     ensure_journal_schema,
     ensure_journals_note_column,
     ensure_person_enrichment_summary_column,
@@ -20,6 +21,7 @@ from database import (
 )
 from openai_client import OPENAI_MODEL, OPENAI_SUGGESTION_TEMPERATURE, openai_chat_completion
 import models
+from journal_emoji_hints import emoji_meaning_hints
 from task_schemas import PersonalityTraitItem
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -33,7 +35,7 @@ import time
 from collections import defaultdict, deque
 from threading import Lock
 
-from auth_deps import CurrentUser
+from auth_deps import AdminUser, CurrentUser
 from auth_middleware import TaskAuthMiddleware
 from auth_tokens import (
     attach_auth_cookies,
@@ -98,7 +100,9 @@ def _parse_cors_config() -> tuple[list[str], Optional[str], bool]:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     from sms_checkin import start_sms_scheduler, stop_sms_scheduler
+    from finances_api import start_finance_job_workers
 
+    start_finance_job_workers()
     start_sms_scheduler()
     yield
     stop_sms_scheduler()
@@ -509,6 +513,7 @@ ensure_auth_columns(engine)
 ensure_person_profile_columns(engine)
 ensure_journal_schema(engine)
 ensure_journals_note_column(engine)
+ensure_finance_schema(engine)
 ensure_person_enrichment_summary_column(engine)
 ensure_person_admin_columns(engine)
 
@@ -737,24 +742,28 @@ def _build_enrich_prompts(
         "You extract task metadata from short user notes. Return strict JSON only with this exact shape: "
         '{"task":{"sentiment":"positive|neutral|negative","category":"string","label":"string","context":"string",'
         '"time_of_day":"string","amount_of_time":"string","day_of_week":"string","personality_traits":["string"]}}. '
-        "If user_profile_summary is present, use it for tone and recurring themes; recent_task_history is optional extra signal."
+        "If user_profile_summary is present, use it for tone and recurring themes; recent_task_history is optional extra signal. "
+        "If emoji appear in the task text, treat them as emotional or emphatic cues; "
+        "when emoji_meaning_hints is present, use those strings as the readable meaning of those symbols."
     )
-    user_prompt = json.dumps(
-        {
-            "task": task,
-            **_llm_user_background(enrichment_summary, task_history, pinned_traits, pinned_goals),
-            "rules": [
-                "Use short concise text.",
-                "If unknown, use 'unspecified'.",
-                "personality_traits should have up to 5 items.",
-                "Each personality_traits item must be a single trait only (no commas, '&', '/', or 'and').",
-                "Do not include the words 'trait' or 'traits' in personality_traits values.",
-                "If pinned_traits are present, personality_traits must include ALL pinned_traits values at least once.",
-                "When pinned_traits are present, additional non-pinned traits may also be generated.",
-                "If pinned_goals are present, align category/label/context toward those goals when reasonable.",
-            ],
-        }
-    )
+    user_obj: dict[str, Any] = {
+        "task": task,
+        **_llm_user_background(enrichment_summary, task_history, pinned_traits, pinned_goals),
+        "rules": [
+            "Use short concise text.",
+            "If unknown, use 'unspecified'.",
+            "personality_traits should have up to 5 items.",
+            "Each personality_traits item must be a single trait only (no commas, '&', '/', or 'and').",
+            "Do not include the words 'trait' or 'traits' in personality_traits values.",
+            "If pinned_traits are present, personality_traits must include ALL pinned_traits values at least once.",
+            "When pinned_traits are present, additional non-pinned traits may also be generated.",
+            "If pinned_goals are present, align category/label/context toward those goals when reasonable.",
+        ],
+    }
+    eh = emoji_meaning_hints(task)
+    if eh:
+        user_obj["emoji_meaning_hints"] = eh
+    user_prompt = json.dumps(user_obj)
     return system_prompt, user_prompt
 
 
@@ -773,14 +782,18 @@ def _build_journal_split_prompts(
         "(2) Produce between 1 and 15 items depending on content; merge fluff; skip empty filler. "
         "(3) Preserve distinct emotionally or practically important beats as separate items when appropriate. "
         "(4) No markdown or unescaped newlines inside JSON string values. "
-        "If user_profile_summary is present, align tone with it when helpful."
+        "If user_profile_summary is present, align tone with it when helpful. "
+        "Treat emoji in journal_text as meaningful emotional or emphatic signals; "
+        "when emoji_meaning_hints is present, use it as readable names for those symbols when splitting and wording items."
     )
-    user_prompt = json.dumps(
-        {
-            "journal_text": journal_text,
-            **_llm_user_background(enrichment_summary, task_history, pinned_traits),
-        }
-    )
+    user_obj: dict[str, Any] = {
+        "journal_text": journal_text,
+        **_llm_user_background(enrichment_summary, task_history, pinned_traits),
+    }
+    eh = emoji_meaning_hints(journal_text)
+    if eh:
+        user_obj["emoji_meaning_hints"] = eh
+    user_prompt = json.dumps(user_obj)
     return system_prompt, user_prompt
 
 
@@ -826,24 +839,28 @@ def _build_batch_enrich_prompts(
         "The tasks array must have the SAME LENGTH and SAME ORDER as the input tasks array. "
         "Each object corresponds to the input string at the same index. "
         "If user_profile_summary is present, use it for consistent tone and trait patterns; "
-        "recent_task_history is optional extra signal."
+        "recent_task_history is optional extra signal. "
+        "If emoji appear in a task string, interpret them for sentiment and emphasis; "
+        "when emoji_meaning_by_task_index is present, each entry lists readable meanings for that task index's emoji."
     )
-    user_prompt = json.dumps(
-        {
-            "tasks": tasks,
-            **_llm_user_background(enrichment_summary, task_history, pinned_traits, pinned_goals),
-            "rules": [
-                "Use short concise text per field.",
-                "If unknown, use 'unspecified'.",
-                "Up to 5 personality_traits per item.",
-                "Each personality_traits item must be a single trait only (no commas, '&', '/', or 'and').",
-                "Do not include the words 'trait' or 'traits' in personality_traits values.",
-                "If pinned_traits are present, each task's personality_traits must include ALL pinned_traits values at least once.",
-                "When pinned_traits are present, additional non-pinned traits may also be generated.",
-                "If pinned_goals are present, align category/label/context toward those goals when reasonable.",
-            ],
-        }
-    )
+    user_obj: dict[str, Any] = {
+        "tasks": tasks,
+        **_llm_user_background(enrichment_summary, task_history, pinned_traits, pinned_goals),
+        "rules": [
+            "Use short concise text per field.",
+            "If unknown, use 'unspecified'.",
+            "Up to 5 personality_traits per item.",
+            "Each personality_traits item must be a single trait only (no commas, '&', '/', or 'and').",
+            "Do not include the words 'trait' or 'traits' in personality_traits values.",
+            "If pinned_traits are present, each task's personality_traits must include ALL pinned_traits values at least once.",
+            "When pinned_traits are present, additional non-pinned traits may also be generated.",
+            "If pinned_goals are present, align category/label/context toward those goals when reasonable.",
+        ],
+    }
+    idx_hints = {str(i): h for i, t in enumerate(tasks) if (h := emoji_meaning_hints(t))}
+    if idx_hints:
+        user_obj["emoji_meaning_by_task_index"] = idx_hints
+    user_prompt = json.dumps(user_obj)
     return system_prompt, user_prompt
 
 
@@ -1089,8 +1106,13 @@ async def auth_login(body: LoginRequest, db: db_dependency, response: Response):
     is_admin = (user.role or "").lower() in {"admin", "support_agent"}
     if is_admin and bool(user.mfa_enabled):
         expected = (os.getenv("ADMIN_MFA_BYPASS_CODE") or "").strip()
-        supplied = (body.model_dump().get("mfa_code") or "")
-        if expected and supplied != expected:
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail="Admin MFA is enabled for this account but the server has no ADMIN_MFA_BYPASS_CODE configured.",
+            )
+        supplied = str(body.model_dump().get("mfa_code") or "").strip()
+        if supplied != expected:
             raise HTTPException(status_code=403, detail="Admin MFA check failed")
     access = create_access_token(user.user_id, is_admin=is_admin)
     refresh = create_refresh_token(user.user_id, is_admin=is_admin)
@@ -1518,11 +1540,19 @@ async def create_suggestion(
     return SuggestionResponse(suggestion=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
 
 
-# --- Users (public lookups / legacy signup) ---
+# --- Users (legacy; all require auth — no public PII or task dumps) ---
+
+
+def _can_view_person_profile(viewer: models.Person, target: models.Person) -> bool:
+    if viewer.user_id == target.user_id:
+        return True
+    role = (viewer.role or "").strip().lower()
+    return role in {"admin", "support_agent"}
 
 
 @app.post("/users/", response_model=PersonModel)
-async def create_user(body: CreateUserRequest, db: db_dependency):
+async def create_user(body: CreateUserRequest, db: db_dependency, _: AdminUser):
+    """Passwordless row creation — admin/support only. Prefer POST /auth/register for normal signup."""
     username = body.username
     existing = db.query(models.Person).filter(models.Person.user_name == username).first()
     if existing is not None:
@@ -1535,30 +1565,30 @@ async def create_user(body: CreateUserRequest, db: db_dependency):
 
 
 @app.get("/users", response_model=List[PersonModel])
-async def read_users(db: db_dependency, skip: int = 0, limit: int = 100):
+async def read_users(db: db_dependency, _: AdminUser, skip: int = 0, limit: int = 100):
     users = db.query(models.Person).offset(skip).limit(limit).all()
     return users
 
 
 @app.get("/user_by_id/{user_id}", response_model=PersonModel)
-async def user_by_id(user_id: str, db: db_dependency):
+async def user_by_id(user_id: str, db: db_dependency, viewer: CurrentUser):
     try:
         uid = UUID(user_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid user id format") from exc
     user = db.query(models.Person).filter(models.Person.user_id == uid).first()
-    if user is None:
+    if user is None or not _can_view_person_profile(viewer, user):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
 
 @app.get("/user_by_username/{username}", response_model=PersonModel)
-async def user_by_user_name(username: str, db: db_dependency):
+async def user_by_user_name(username: str, db: db_dependency, viewer: CurrentUser):
     key = username.strip()
     if not key:
         raise HTTPException(status_code=400, detail="Username required")
     user = db.query(models.Person).filter(models.Person.user_name == key).first()
-    if user is None:
+    if user is None or not _can_view_person_profile(viewer, user):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
@@ -1568,12 +1598,14 @@ from growth_analytics import router as growth_router
 from admin_support_api import router as admin_support_router
 from personality_analytics import router as analytics_router
 from sms_checkin import sms_router
+from finances_api import router as finances_router
 
 app.include_router(journal_router)
 app.include_router(growth_router)
 app.include_router(admin_support_router)
 app.include_router(analytics_router)
 app.include_router(sms_router)
+app.include_router(finances_router)
 
 
 if __name__ == "__main__":

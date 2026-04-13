@@ -221,3 +221,28 @@ def ensure_journal_schema(engine) -> None:
                     "FOREIGN KEY (journal_id) REFERENCES journals(journal_id) ON DELETE CASCADE"
                 )
             )
+
+
+def ensure_finance_schema(engine) -> None:
+    """Add finance columns/indexes for existing DBs; new DBs use create_all models."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    if not insp.has_table("finance_transactions"):
+        return
+    cols = {c["name"] for c in insp.get_columns("finance_transactions")}
+    stmts: list[str] = []
+    if "merchant_normalized" not in cols:
+        stmts.append("ALTER TABLE finance_transactions ADD COLUMN merchant_normalized VARCHAR(200)")
+    if "is_hidden_from_charts" not in cols:
+        if engine.dialect.name == "sqlite":
+            stmts.append("ALTER TABLE finance_transactions ADD COLUMN is_hidden_from_charts INTEGER NOT NULL DEFAULT 0")
+        else:
+            stmts.append("ALTER TABLE finance_transactions ADD COLUMN is_hidden_from_charts BOOLEAN NOT NULL DEFAULT false")
+    if "deleted_at" not in cols:
+        stmts.append("ALTER TABLE finance_transactions ADD COLUMN deleted_at TIMESTAMPTZ")
+    if not stmts:
+        return
+    with engine.begin() as conn:
+        for sql in stmts:
+            conn.execute(text(sql))
