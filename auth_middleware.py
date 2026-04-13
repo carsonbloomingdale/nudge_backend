@@ -37,6 +37,12 @@ def _path_requires_task_auth(path: str) -> bool:
         return True
     if p.startswith("/api/analytics"):
         return True
+    if p.startswith("/api/growth-goals"):
+        return True
+    if p.startswith("/api/support"):
+        return True
+    if p.startswith("/api/admin"):
+        return True
     return False
 
 

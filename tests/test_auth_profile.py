@@ -336,3 +336,75 @@ def test_patch_extra_json_keys_ignored(client, register_user):
     )
     assert r.status_code == 200
     assert r.json()["first_name"] == "Fred"
+
+
+def _set_role(username: str, role: str) -> None:
+    db = SessionLocal()
+    try:
+        u = db.query(models.Person).filter(models.Person.user_name == username).first()
+        assert u is not None
+        u.role = role
+        db.add(u)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_legacy_user_routes_require_auth_and_scoping(client, register_user):
+    assert client.get("/users").status_code == 401
+
+    token_a, username_a, _ = register_user(suffix="lega")
+    token_b, username_b, _ = register_user(suffix="legb")
+    me_b = client.get("/auth/me", headers=_bearer_headers(token_b)).json()
+    uid_b = me_b["user_id"]
+
+    assert client.get("/users", headers=_bearer_headers(token_a)).status_code == 403
+
+    _set_role(username_a, "admin")
+    assert client.get("/users", headers=_bearer_headers(token_a)).status_code == 200
+
+    assert client.get(f"/user_by_id/{uid_b}", headers=_bearer_headers(token_a)).status_code == 200
+    assert client.get(f"/user_by_id/{uid_b}", headers=_bearer_headers(token_b)).status_code == 200
+    token_c, _, _ = register_user(suffix="legc")
+    assert client.get(f"/user_by_id/{uid_b}", headers=_bearer_headers(token_c)).status_code == 404
+
+    assert (
+        client.get(f"/user_by_username/{username_b}", headers=_bearer_headers(token_b)).status_code == 200
+    )
+    assert (
+        client.get(f"/user_by_username/{username_b}", headers=_bearer_headers(token_c)).status_code == 404
+    )
+
+    create = client.post(
+        "/users/",
+        headers=_bearer_headers(token_c),
+        json={"username": "legacy_public_denied"},
+    )
+    assert create.status_code == 403
+
+    ok = client.post(
+        "/users/",
+        headers=_bearer_headers(token_a),
+        json={"username": "legacy_admin_created"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["user_name"] == "legacy_admin_created"
+
+
+def test_admin_login_when_mfa_enabled_requires_bypass_configured(client, register_user, monkeypatch):
+    _, username, email = register_user(suffix="mfalogin")
+    db = SessionLocal()
+    try:
+        u = db.query(models.Person).filter(models.Person.user_name == username).first()
+        assert u is not None
+        u.role = "admin"
+        u.mfa_enabled = True
+        db.add(u)
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.delenv("ADMIN_MFA_BYPASS_CODE", raising=False)
+    client.cookies.clear()
+    r = client.post("/auth/login", json={"email": email, "password": "password123"})
+    assert r.status_code == 503
+    assert "ADMIN_MFA_BYPASS_CODE" in r.json()["detail"]
