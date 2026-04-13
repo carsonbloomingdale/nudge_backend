@@ -36,6 +36,7 @@ from twilio.request_validator import RequestValidator
 
 import models
 from database import DbSession, SessionLocal
+from journal_emoji_hints import emoji_meaning_hints
 from openai_client import OPENAI_API_KEY, openai_chat_completion
 
 logger = logging.getLogger(__name__)
@@ -316,9 +317,16 @@ async def _extract_tasks_from_reply(sms_text: str, day_of_week: str) -> list[dic
         '"category":"string","label":"string","context":"string","time_of_day":"string",'
         '"amount_of_time":"string","day_of_week":"string"}]}. '
         "Use up to 5 tasks if they clearly did multiple things; otherwise one task. "
-        "Use short strings; if unknown use 'unspecified'."
+        "Use short strings; if unknown use 'unspecified'. "
+        "If emoji appear in sms_reply, interpret them for emotion and emphasis; "
+        "when emoji_meaning_hints is present, use those strings as readable names for those symbols."
     )
-    user_prompt = json.dumps({"sms_reply": sms_text[:800], "local_day_of_week": day_of_week})
+    sms_chunk = sms_text[:800]
+    user_obj: dict[str, Any] = {"sms_reply": sms_chunk, "local_day_of_week": day_of_week}
+    eh = emoji_meaning_hints(sms_chunk)
+    if eh:
+        user_obj["emoji_meaning_hints"] = eh
+    user_prompt = json.dumps(user_obj)
     try:
         raw, _ = await openai_chat_completion(system_prompt, user_prompt, temperature=0.2)
     except HTTPException as exc:
