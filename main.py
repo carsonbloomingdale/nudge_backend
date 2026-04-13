@@ -33,7 +33,7 @@ import time
 from collections import defaultdict, deque
 from threading import Lock
 
-from auth_deps import CurrentUser
+from auth_deps import AdminUser, CurrentUser
 from auth_middleware import TaskAuthMiddleware
 from auth_tokens import (
     attach_auth_cookies,
@@ -1089,8 +1089,13 @@ async def auth_login(body: LoginRequest, db: db_dependency, response: Response):
     is_admin = (user.role or "").lower() in {"admin", "support_agent"}
     if is_admin and bool(user.mfa_enabled):
         expected = (os.getenv("ADMIN_MFA_BYPASS_CODE") or "").strip()
-        supplied = (body.model_dump().get("mfa_code") or "")
-        if expected and supplied != expected:
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail="Admin MFA is enabled for this account but the server has no ADMIN_MFA_BYPASS_CODE configured.",
+            )
+        supplied = str(body.model_dump().get("mfa_code") or "").strip()
+        if supplied != expected:
             raise HTTPException(status_code=403, detail="Admin MFA check failed")
     access = create_access_token(user.user_id, is_admin=is_admin)
     refresh = create_refresh_token(user.user_id, is_admin=is_admin)
@@ -1518,11 +1523,19 @@ async def create_suggestion(
     return SuggestionResponse(suggestion=normalized, meta=OpenAIRequestMeta(model=OPENAI_MODEL, retries_used=retries_used))
 
 
-# --- Users (public lookups / legacy signup) ---
+# --- Users (legacy; all require auth — no public PII or task dumps) ---
+
+
+def _can_view_person_profile(viewer: models.Person, target: models.Person) -> bool:
+    if viewer.user_id == target.user_id:
+        return True
+    role = (viewer.role or "").strip().lower()
+    return role in {"admin", "support_agent"}
 
 
 @app.post("/users/", response_model=PersonModel)
-async def create_user(body: CreateUserRequest, db: db_dependency):
+async def create_user(body: CreateUserRequest, db: db_dependency, _: AdminUser):
+    """Passwordless row creation — admin/support only. Prefer POST /auth/register for normal signup."""
     username = body.username
     existing = db.query(models.Person).filter(models.Person.user_name == username).first()
     if existing is not None:
@@ -1535,30 +1548,30 @@ async def create_user(body: CreateUserRequest, db: db_dependency):
 
 
 @app.get("/users", response_model=List[PersonModel])
-async def read_users(db: db_dependency, skip: int = 0, limit: int = 100):
+async def read_users(db: db_dependency, _: AdminUser, skip: int = 0, limit: int = 100):
     users = db.query(models.Person).offset(skip).limit(limit).all()
     return users
 
 
 @app.get("/user_by_id/{user_id}", response_model=PersonModel)
-async def user_by_id(user_id: str, db: db_dependency):
+async def user_by_id(user_id: str, db: db_dependency, viewer: CurrentUser):
     try:
         uid = UUID(user_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid user id format") from exc
     user = db.query(models.Person).filter(models.Person.user_id == uid).first()
-    if user is None:
+    if user is None or not _can_view_person_profile(viewer, user):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
 
 @app.get("/user_by_username/{username}", response_model=PersonModel)
-async def user_by_user_name(username: str, db: db_dependency):
+async def user_by_user_name(username: str, db: db_dependency, viewer: CurrentUser):
     key = username.strip()
     if not key:
         raise HTTPException(status_code=400, detail="Username required")
     user = db.query(models.Person).filter(models.Person.user_name == key).first()
-    if user is None:
+    if user is None or not _can_view_person_profile(viewer, user):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 

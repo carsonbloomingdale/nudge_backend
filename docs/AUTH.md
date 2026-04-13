@@ -161,9 +161,11 @@ Middleware + `Depends(get_current_user)` enforce auth on:
 
 ---
 
-## Optional / legacy (still available)
+## Optional / legacy (authenticated only)
 
-- `GET /user_by_username/...`, `GET /user_by_id/...`, `POST /users/` — legacy helpers; main app flow should use **cookie auth** + **`/auth/*`** + **`/auth/me`**.
+- `GET /user_by_username/...` and `GET /user_by_id/...` — require a valid session; you may only load **your own** profile unless the account role is **admin** or **support_agent**.
+- `GET /users` — **admin/support only** (lists all users and embedded tasks in the response model).
+- `POST /users/` — **admin/support only** passwordless row creation; normal signup is **`POST /auth/register`**.
 
 ---
 
